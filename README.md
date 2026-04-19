@@ -57,7 +57,7 @@ Pair WhatsApp:
 
 ```bash
 cd bridge
-WHATSAPP_MODE=bot WHATSAPP_ALLOWED_USERS=15551234567 node bridge.js --pair-only --session ~/.codex-whatsapp/whatsapp/session --mode bot
+WHATSAPP_MODE=bot WHATSAPP_ALLOWED_USERS=15551234567 WHATSAPP_PORT=3010 node bridge.js --pair-only --port 3010 --session ~/.codex-whatsapp/whatsapp/session --mode bot
 ```
 
 Run the gateway:
@@ -65,6 +65,8 @@ Run the gateway:
 ```bash
 CW_ENV_FILE=$PWD/.env .venv/bin/python server/gateway.py
 ```
+
+If port `3000` is already taken on your box, set `WHATSAPP_PORT` in `.env` to something else like `3010`.
 
 ## systemd user service
 
