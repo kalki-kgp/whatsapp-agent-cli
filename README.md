@@ -1,11 +1,14 @@
-# Codex WhatsApp Gateway
+# CLI WhatsApp Bridge
 
-Run Codex behind a dedicated WhatsApp number.
+Run a coding CLI behind a dedicated WhatsApp number.
 
 ## What it does
 
 - Runs a Baileys-based WhatsApp bridge on the server
-- Maps each WhatsApp chat to a persistent Codex thread
+- Lets you choose a backend during install:
+  - `codex`
+  - `claude`
+- Maps each WhatsApp chat to a persistent backend session
 - Sends replies back through WhatsApp
 - Supports gateway commands:
 - `/status`
@@ -17,67 +20,71 @@ Run Codex behind a dedicated WhatsApp number.
 - `/compact`
 - `/help`
 
-## How it works
+## Install
 
-The bridge receives WhatsApp messages over Baileys and exposes a small local HTTP API.
-The Python gateway polls that bridge, maps each chat to a Codex thread, and runs Codex
-non-interactively on the server. Replies go back through the same WhatsApp bridge.
+Clone the repo and run the installer:
+
+```bash
+git clone https://github.com/kalki-kgp/codex-whatsapp.git
+cd codex-whatsapp
+bash scripts/install.sh
+```
+
+The installer will:
+
+- ask which backend you want to control (`codex` or `claude`)
+- install Python and Node dependencies
+- write `.env`
+- install a user `systemd` service
+- offer to pair WhatsApp immediately
+
+By default it installs into `~/.agent-whatsapp` and uses the service name `agent-whatsapp.service`.
 
 ## Layout
 
 - `bridge/` - Node WhatsApp bridge
-- `server/gateway.py` - long-running Codex gateway
-- `systemd/codex-whatsapp.service` - user service unit
+- `server/gateway.py` - long-running backend-neutral gateway
+- `scripts/install.sh` - guided installer
+- `scripts/pair.sh` - QR pairing helper
+- `systemd/agent-whatsapp.service` - generic user service unit
 
 ## Requirements
 
 - Node.js 18+
 - Python 3.11+ or `uv`
-- `codex` installed and authenticated on the server
+- `codex` or `claude` installed and authenticated on the server
 - A WhatsApp account/number to pair with the bridge
 
 ## Quick start
 
 ```bash
-git clone https://github.com/<you>/codex-whatsapp.git
-cd codex-whatsapp
-
-cp .env.example .env
-# edit .env
-
-uv venv .venv
-uv pip install --python .venv/bin/python -r requirements.txt
-
-cd bridge
-npm install
-cd ..
+bash scripts/install.sh
 ```
 
 Pair WhatsApp:
 
 ```bash
-cd bridge
-WHATSAPP_MODE=bot WHATSAPP_ALLOWED_USERS=15551234567 WHATSAPP_PORT=3010 node bridge.js --pair-only --port 3010 --session ~/.codex-whatsapp/whatsapp/session --mode bot
+bash ~/.agent-whatsapp/scripts/pair.sh
 ```
 
 Run the gateway:
 
 ```bash
-CW_ENV_FILE=$PWD/.env .venv/bin/python server/gateway.py
+bash ~/.agent-whatsapp/scripts/start.sh
 ```
 
 If port `3000` is already taken on your box, set `WHATSAPP_PORT` in `.env` to something else like `3010`.
 
 ## systemd user service
 
-Copy the service unit to `~/.config/systemd/user/codex-whatsapp.service`, then:
+The installer copies `systemd/agent-whatsapp.service` to `~/.config/systemd/user/agent-whatsapp.service`, then reloads `systemd`.
 
 ```bash
 systemctl --user daemon-reload
-systemctl --user enable --now codex-whatsapp.service
+systemctl --user enable --now agent-whatsapp.service
 ```
 
-The unit expects the project at `~/.codex-whatsapp` by default. Adjust the paths if you install it elsewhere.
+The unit expects the project at `~/.agent-whatsapp` by default.
 
 ## Chat commands
 
@@ -92,7 +99,7 @@ The unit expects the project at `~/.codex-whatsapp` by default. Adjust the paths
 
 ## Notes
 
-- The service expects Codex credentials in `~/.codex/auth.json`.
-- The WhatsApp session lives under `~/.codex-whatsapp/whatsapp/session`.
-- The default Codex working root is controlled by `CODEX_ROOT`.
+- The service expects the chosen backend to already be authenticated on the machine.
+- The WhatsApp session lives under `~/.agent-whatsapp/whatsapp/session` on a default install.
+- The default working root is controlled by `AGENT_ROOT`.
 - `.env` is intentionally gitignored. Use `.env.example` as the template.

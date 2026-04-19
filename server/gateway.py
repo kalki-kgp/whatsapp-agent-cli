@@ -10,6 +10,7 @@ from collections import deque
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import aiohttp
 
@@ -35,10 +36,18 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_first(*names: str, default: str = "") -> str:
+    for name in names:
+        value = os.getenv(name)
+        if value is not None and value.strip():
+            return value.strip()
+    return default
+
+
 class Config:
     def __init__(self) -> None:
-        self.home = Path(os.getenv("CW_HOME", "~/.codex-whatsapp")).expanduser()
-        self.bridge_port = int(os.getenv("WHATSAPP_PORT", "3000"))
+        self.home = Path(_env_first("AGENT_WHATSAPP_HOME", "CW_HOME", default="~/.agent-whatsapp")).expanduser()
+        self.bridge_port = int(_env_first("WHATSAPP_PORT", default="3010"))
         self.bridge_dir = Path(
             os.getenv("WHATSAPP_BRIDGE_DIR", str(self.home / "bridge"))
         ).expanduser()
@@ -49,10 +58,20 @@ class Config:
         self.state_file = Path(
             os.getenv("CW_STATE_FILE", str(self.home / "state.json"))
         ).expanduser()
-        self.codex_bin = os.getenv("CODEX_BIN", "codex")
-        self.default_root = Path(os.getenv("CODEX_ROOT", "~")).expanduser().resolve()
-        self.model = os.getenv("CODEX_MODEL", "").strip()
-        self.enable_search = _env_flag("CODEX_SEARCH", default=False)
+        self.backend = _env_first("AGENT_BACKEND", default="codex").lower()
+        self.agent_command = _env_first(
+            "AGENT_COMMAND",
+            "CODEX_BIN" if self.backend == "codex" else "CLAUDE_BIN",
+            default="codex" if self.backend == "codex" else "claude",
+        )
+        self.default_root = Path(
+            _env_first("AGENT_ROOT", "CODEX_ROOT", "CLAUDE_ROOT", default="~")
+        ).expanduser().resolve()
+        self.model = _env_first("AGENT_MODEL", "CODEX_MODEL", "CLAUDE_MODEL", default="")
+        self.enable_search = _env_flag(
+            "AGENT_SEARCH",
+            default=_env_flag("CODEX_SEARCH", default=False),
+        )
         self.reply_prefix = os.getenv("WHATSAPP_REPLY_PREFIX", "")
         self.allowed_users = os.getenv("WHATSAPP_ALLOWED_USERS", "").strip()
         self.mode = os.getenv("WHATSAPP_MODE", "bot").strip() or "bot"
@@ -142,14 +161,14 @@ def build_prompt(event: dict[str, Any], root: str) -> tuple[str, list[str]]:
         media_lines.append(f"- {media_type or 'file'}: {path}")
 
     prompt = (
-        "You are replying to a WhatsApp user through a server-side Codex gateway.\n"
+        "You are replying to a WhatsApp user through a server-side CLI coding agent gateway.\n"
         "Keep responses concise, direct, and practical.\n"
         "If you make changes or run commands, summarize only the important outcome.\n"
         f"Current workspace root: {root}\n"
         f"WhatsApp chat id: {event.get('chatId')}\n"
         f"Sender: {event.get('senderName') or event.get('senderId')}\n"
         "\n"
-        "Gateway admin commands like /reset and /root are handled outside of Codex.\n"
+        "Gateway admin commands like /reset and /root are handled outside of the agent.\n"
         "Treat the content below as the user's actual message.\n"
         "\n"
         "User message:\n"
@@ -240,7 +259,7 @@ def resolve_saved_session(chat_state: dict[str, Any], query: str) -> dict[str, A
     return None
 
 
-class CodexWhatsAppGateway:
+class WhatsAppAgentGateway:
     def __init__(self, config: Config) -> None:
         self.config = config
         self.state = StateStore(config.state_file, config.default_root)
@@ -381,7 +400,7 @@ class CodexWhatsAppGateway:
         root = chat_state.get("root", self.state.default_root)
         await self.start_typing(chat_id)
         try:
-            reply, thread_id = await self.run_codex(event, chat_state, root)
+            reply, thread_id = await self.run_agent(event, chat_state, root)
         finally:
             await self.stop_typing(chat_id)
 
@@ -414,7 +433,7 @@ class CodexWhatsAppGateway:
             saved_count = len(chat_state.get("saved_sessions") or [])
             await self.send_message(
                 chat_id,
-                f"Root: {root}\nThread: {thread_id}\nModel: {model}\nSummary: {summary}\nSaved sessions: {saved_count}\nMode: {self.config.mode}",
+                f"Backend: {self.config.backend}\nRoot: {root}\nThread: {thread_id}\nModel: {model}\nSummary: {summary}\nSaved sessions: {saved_count}\nMode: {self.config.mode}",
             )
             return True
 
@@ -529,7 +548,7 @@ class CodexWhatsAppGateway:
         root = chat_state.get("root", self.state.default_root)
         existing_summary = (chat_state.get("summary") or "").strip()
         prompt = (
-            "Compact this conversation into a durable working summary for a future Codex session.\n"
+            "Compact this conversation into a durable working summary for a future session.\n"
             "Include: goals, current repo/root, relevant files, decisions already made, unfinished work, and important constraints.\n"
             "Write it as concise bullet points.\n"
         )
@@ -543,11 +562,23 @@ class CodexWhatsAppGateway:
             "mediaUrls": [],
             "mediaType": "",
         }
-        summary, _ = await self.run_codex(fake_event, chat_state, root, prompt_override=prompt)
+        summary, _ = await self.run_agent(fake_event, chat_state, root, prompt_override=prompt)
         archive_snapshot(chat_state, force=True)
         chat_state["summary"] = summary.strip()
         clear_active_session(chat_state, keep_summary=True)
         return summary.strip(), None
+
+    async def run_agent(
+        self,
+        event: dict[str, Any],
+        chat_state: dict[str, Any],
+        root: str,
+        *,
+        prompt_override: str | None = None,
+    ) -> tuple[str, str | None]:
+        if self.config.backend == "claude":
+            return await self.run_claude(event, chat_state, root, prompt_override=prompt_override)
+        return await self.run_codex(event, chat_state, root, prompt_override=prompt_override)
 
     async def run_codex(
         self,
@@ -570,7 +601,7 @@ class CodexWhatsAppGateway:
             )
         existing_thread = chat_state.get("thread_id")
         out_path = Path(tempfile.mkstemp(prefix="codex-wa-", suffix=".txt")[1])
-        args = [self.config.codex_bin, "exec"]
+        args = [self.config.agent_command, "exec"]
         if existing_thread:
             args.extend(["resume", "--json"])
         else:
@@ -619,6 +650,79 @@ class CodexWhatsAppGateway:
             out_path.unlink(missing_ok=True)
         except Exception:
             pass
+
+        return reply or "Done.", thread_id
+
+    async def run_claude(
+        self,
+        event: dict[str, Any],
+        chat_state: dict[str, Any],
+        root: str,
+        *,
+        prompt_override: str | None = None,
+    ) -> tuple[str, str | None]:
+        prompt, _ = build_prompt(event, root)
+        if prompt_override is not None:
+            prompt = prompt_override
+        summary = (chat_state.get("summary") or "").strip()
+        title = (chat_state.get("title") or "").strip()
+        if summary and prompt_override is None:
+            prompt = (
+                f"Carried session summary:\n{summary}\n\n"
+                + (f"Session title: {title}\n\n" if title else "")
+                + prompt
+            )
+
+        existing_thread = (chat_state.get("thread_id") or "").strip()
+        thread_id = existing_thread or str(uuid4())
+        args = [
+            self.config.agent_command,
+            "-p",
+            "--output-format",
+            "json",
+            "--permission-mode",
+            "bypassPermissions",
+            "--add-dir",
+            str(root),
+        ]
+        if existing_thread:
+            args.extend(["--resume", existing_thread])
+        else:
+            args.extend(["--session-id", thread_id])
+
+        selected_model = (chat_state.get("model") or self.config.model).strip()
+        if selected_model:
+            args.extend(["--model", selected_model])
+        args.append(prompt)
+
+        LOG.info("Running Claude for chat %s: %s", event["chatId"], shlex.join(args[:-1]) + " <prompt>")
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=os.environ.copy(),
+        )
+        stdout, stderr = await proc.communicate()
+        stdout_text = stdout.decode("utf-8", errors="replace").strip()
+        stderr_text = stderr.decode("utf-8", errors="replace").strip()
+
+        try:
+            payload = json.loads(stdout_text) if stdout_text else {}
+        except json.JSONDecodeError:
+            payload = {}
+
+        if payload.get("session_id"):
+            thread_id = str(payload["session_id"])
+
+        reply = str(payload.get("result") or "").strip()
+        is_error = bool(payload.get("is_error"))
+        if proc.returncode != 0 or is_error:
+            combined = "\n".join(part for part in [stderr_text, stdout_text] if part).lower()
+            if existing_thread and "session" in combined and "not found" in combined:
+                chat_state.pop("thread_id", None)
+                return await self.run_claude(event, chat_state, root, prompt_override=prompt_override)
+            detail = stderr_text or stdout_text or "Claude exited with an unknown error."
+            reply = reply or f"Claude failed:\n{detail[:1500]}"
 
         return reply or "Done.", thread_id
 
@@ -675,12 +779,12 @@ class CodexWhatsAppGateway:
 
 
 async def _main() -> None:
-    load_env_file(Path(os.getenv("CW_ENV_FILE", "~/.codex-whatsapp/.env")).expanduser())
+    load_env_file(Path(_env_first("AGENT_ENV_FILE", "CW_ENV_FILE", default="~/.agent-whatsapp/.env")).expanduser())
     logging.basicConfig(
         level=os.getenv("CW_LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    gateway = CodexWhatsAppGateway(Config())
+    gateway = WhatsAppAgentGateway(Config())
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, gateway.stop_event.set)
