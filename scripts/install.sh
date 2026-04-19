@@ -518,9 +518,12 @@ main() {
     local mode_default=1
     [[ "$MODE" == "self-chat" ]] && mode_default=2
     menu_select "WhatsApp mode" \
-      "bot = a separate WhatsApp account messages you. self-chat = you message yourself." \
-      $mode_default "bot" "self-chat"
-    MODE="$MENU_RESULT"
+      "How will messages reach the agent?" \
+      $mode_default \
+      "bot        (a separate WhatsApp account DMs the agent — recommended)" \
+      "self-chat  (you message yourself from your own WhatsApp account)"
+    # strip the trailing description back off
+    MODE="${MENU_RESULT%% *}"
   fi
 
   # ── allowed users ─────────────────────────────────────────────────────────
@@ -585,16 +588,8 @@ main() {
   run_step "writing $INSTALL_DIR/.env"       write_env_file
   run_step "installing systemd user service" install_systemd_unit
 
-  # ── done ──────────────────────────────────────────────────────────────────
-  section "Done"
-  ok "Installed into ${BOLD}$INSTALL_DIR${RESET}"
-  ok "Service ${BOLD}$SERVICE_NAME.service${RESET}"
-  echo
-  note "Pair WhatsApp:    bash $INSTALL_DIR/scripts/pair.sh"
-  note "Start service:    systemctl --user start $SERVICE_NAME.service"
-  note "Tail logs:        journalctl --user -u $SERVICE_NAME.service -f"
-  echo
-
+  # ── pair (optional) ───────────────────────────────────────────────────────
+  local paired=0
   if [[ $INTERACTIVE -eq 1 ]]; then
     if confirm "Pair WhatsApp now?" \
         "Prints a QR code in this terminal. Scan with WhatsApp → Linked devices." \
@@ -602,14 +597,70 @@ main() {
       "$INSTALL_DIR/scripts/pair.sh"
       if command -v systemctl >/dev/null 2>&1; then
         systemctl --user restart "$SERVICE_NAME.service" || true
-        ok "Paired and service restarted."
-      else
-        ok "Paired."
       fi
-    else
-      note "When you're ready: bash $INSTALL_DIR/scripts/pair.sh"
+      paired=1
     fi
   fi
+
+  print_finished "$paired"
+}
+
+# ── final cheat sheet ────────────────────────────────────────────────────────
+print_finished() {
+  local paired="$1"
+  local has_systemctl=0
+  command -v systemctl >/dev/null 2>&1 && has_systemctl=1
+
+  printf '\n  %s──%s %s%s%s\n' \
+    "$GREEN" "$RESET" "$BOLD" "Congratulations — your WhatsApp coding agent is installed." "$RESET"
+  ok "Installed into ${BOLD}$INSTALL_DIR${RESET}"
+  if [[ "$paired" == "1" ]]; then
+    if [[ $has_systemctl -eq 1 ]]; then
+      ok "WhatsApp paired and service restarted."
+    else
+      ok "WhatsApp paired."
+    fi
+    note "Send a message from an allowed number to test it."
+  else
+    note "Pair when you're ready: ${BOLD}bash $INSTALL_DIR/scripts/pair.sh${RESET}"
+  fi
+
+  printf '\n  %s%s%s\n' "$BOLD" "Cheatsheet" "$RESET"
+  printf '  %s%s%s\n\n' "$DIM" "Re-run anytime — these are safe to bookmark." "$RESET"
+
+  printf '  %sChange CLI / model / port / root / numbers%s\n' "$BOLD" "$RESET"
+  printf '    bash %s/scripts/install.sh --reconfigure\n\n' "$INSTALL_DIR"
+
+  printf '  %sAdd or remove allowed numbers%s\n' "$BOLD" "$RESET"
+  printf '    bash %s/scripts/install.sh --reconfigure\n' "$INSTALL_DIR"
+  printf '    %sor edit WHATSAPP_ALLOWED_USERS in %s/.env, then restart the service%s\n\n' \
+    "$DIM" "$INSTALL_DIR" "$RESET"
+
+  printf '  %sRe-pair WhatsApp%s  %s(switched phone, lost session)%s\n' "$BOLD" "$RESET" "$DIM" "$RESET"
+  printf '    bash %s/scripts/pair.sh\n\n' "$INSTALL_DIR"
+
+  if [[ $has_systemctl -eq 1 ]]; then
+    printf '  %sService control%s\n' "$BOLD" "$RESET"
+    printf '    systemctl --user start    %s.service\n' "$SERVICE_NAME"
+    printf '    systemctl --user stop     %s.service\n' "$SERVICE_NAME"
+    printf '    systemctl --user restart  %s.service\n' "$SERVICE_NAME"
+    printf '    systemctl --user status   %s.service --no-pager\n\n' "$SERVICE_NAME"
+
+    printf '  %sLive logs%s\n' "$BOLD" "$RESET"
+    printf '    journalctl --user -u %s.service -f\n\n' "$SERVICE_NAME"
+  else
+    printf '  %sRun the gateway%s  %s(no systemd on this OS — run manually)%s\n' \
+      "$BOLD" "$RESET" "$DIM" "$RESET"
+    printf '    source %s/.venv/bin/activate && python %s/server/gateway.py\n\n' \
+      "$INSTALL_DIR" "$INSTALL_DIR"
+  fi
+
+  printf '  %sEdit raw config%s\n' "$BOLD" "$RESET"
+  printf '    $EDITOR %s/.env\n\n' "$INSTALL_DIR"
+
+  printf '  %sIn-chat commands%s  %s(send via WhatsApp)%s\n' "$BOLD" "$RESET" "$DIM" "$RESET"
+  printf '    /status   /new   /reset   /resume   /title <name>\n'
+  printf '    /root /abs/path   /model <name>   /compact   /help\n\n'
 }
 
 main "$@"
