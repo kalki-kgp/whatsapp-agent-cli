@@ -1,0 +1,12 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+node_modules/
+logs/
+state.json
+whatsapp/
+image_cache/
+audio_cache/
+document_cache/
