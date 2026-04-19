@@ -28,6 +28,54 @@ import { randomBytes } from 'crypto';
 import qrcode from 'qrcode-terminal';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
 
+function unwrapMessageContent(message) {
+  let current = message;
+  const wrappers = [
+    'ephemeralMessage',
+    'viewOnceMessage',
+    'viewOnceMessageV2',
+    'viewOnceMessageV2Extension',
+    'documentWithCaptionMessage',
+    'editedMessage',
+  ];
+
+  while (current && typeof current === 'object') {
+    let advanced = false;
+
+    for (const key of wrappers) {
+      const next = current?.[key]?.message;
+      if (next && typeof next === 'object') {
+        current = next;
+        advanced = true;
+        break;
+      }
+    }
+
+    if (advanced) continue;
+
+    const template = current?.templateMessage;
+    const hydrated = template?.hydratedTemplate;
+    if (hydrated?.hydratedContentText || hydrated?.hydratedButtons) {
+      return {
+        extendedTextMessage: hydrated.hydratedContentText
+          ? { text: hydrated.hydratedContentText }
+          : undefined,
+      };
+    }
+
+    const buttons = current?.buttonsMessage;
+    if (buttons?.contentText) {
+      return {
+        extendedTextMessage: { text: buttons.contentText },
+      };
+    }
+
+    return current;
+  }
+
+  return current;
+}
+
 // Parse CLI args
 const args = process.argv.slice(2);
 function getArg(name, defaultVal) {
@@ -159,6 +207,8 @@ async function startSocket() {
 
     for (const msg of messages) {
       if (!msg.message) continue;
+      const messageContent = unwrapMessageContent(msg.message);
+      if (!messageContent) continue;
 
       const chatId = msg.key.remoteJid;
       if (WHATSAPP_DEBUG) {
@@ -167,7 +217,7 @@ async function startSocket() {
             event: 'upsert', type,
             fromMe: !!msg.key.fromMe, chatId,
             senderId: msg.key.participant || chatId,
-            messageKeys: Object.keys(msg.message || {}),
+            messageKeys: Object.keys(messageContent || {}),
           }));
         } catch {}
       }
@@ -206,17 +256,17 @@ async function startSocket() {
       let mediaType = '';
       const mediaUrls = [];
 
-      if (msg.message.conversation) {
-        body = msg.message.conversation;
-      } else if (msg.message.extendedTextMessage?.text) {
-        body = msg.message.extendedTextMessage.text;
-      } else if (msg.message.imageMessage) {
-        body = msg.message.imageMessage.caption || '';
+      if (messageContent.conversation) {
+        body = messageContent.conversation;
+      } else if (messageContent.extendedTextMessage?.text) {
+        body = messageContent.extendedTextMessage.text;
+      } else if (messageContent.imageMessage) {
+        body = messageContent.imageMessage.caption || '';
         hasMedia = true;
         mediaType = 'image';
         try {
           const buf = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage });
-          const mime = msg.message.imageMessage.mimetype || 'image/jpeg';
+          const mime = messageContent.imageMessage.mimetype || 'image/jpeg';
           const extMap = { 'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp', 'image/gif': '.gif' };
           const ext = extMap[mime] || '.jpg';
           mkdirSync(IMAGE_CACHE_DIR, { recursive: true });
@@ -226,13 +276,13 @@ async function startSocket() {
         } catch (err) {
           console.error('[bridge] Failed to download image:', err.message);
         }
-      } else if (msg.message.videoMessage) {
-        body = msg.message.videoMessage.caption || '';
+      } else if (messageContent.videoMessage) {
+        body = messageContent.videoMessage.caption || '';
         hasMedia = true;
         mediaType = 'video';
         try {
           const buf = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage });
-          const mime = msg.message.videoMessage.mimetype || 'video/mp4';
+          const mime = messageContent.videoMessage.mimetype || 'video/mp4';
           const ext = mime.includes('mp4') ? '.mp4' : '.mkv';
           mkdirSync(DOCUMENT_CACHE_DIR, { recursive: true });
           const filePath = path.join(DOCUMENT_CACHE_DIR, `vid_${randomBytes(6).toString('hex')}${ext}`);
@@ -241,11 +291,11 @@ async function startSocket() {
         } catch (err) {
           console.error('[bridge] Failed to download video:', err.message);
         }
-      } else if (msg.message.audioMessage || msg.message.pttMessage) {
+      } else if (messageContent.audioMessage || messageContent.pttMessage) {
         hasMedia = true;
-        mediaType = msg.message.pttMessage ? 'ptt' : 'audio';
+        mediaType = messageContent.pttMessage ? 'ptt' : 'audio';
         try {
-          const audioMsg = msg.message.pttMessage || msg.message.audioMessage;
+          const audioMsg = messageContent.pttMessage || messageContent.audioMessage;
           const buf = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage });
           const mime = audioMsg.mimetype || 'audio/ogg';
           const ext = mime.includes('ogg') ? '.ogg' : mime.includes('mp4') ? '.m4a' : '.ogg';
@@ -256,11 +306,11 @@ async function startSocket() {
         } catch (err) {
           console.error('[bridge] Failed to download audio:', err.message);
         }
-      } else if (msg.message.documentMessage) {
-        body = msg.message.documentMessage.caption || '';
+      } else if (messageContent.documentMessage) {
+        body = messageContent.documentMessage.caption || '';
         hasMedia = true;
         mediaType = 'document';
-        const fileName = msg.message.documentMessage.fileName || 'document';
+        const fileName = messageContent.documentMessage.fileName || 'document';
         try {
           const buf = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage });
           mkdirSync(DOCUMENT_CACHE_DIR, { recursive: true });
@@ -290,7 +340,7 @@ async function startSocket() {
       if (!body && !hasMedia) {
         if (WHATSAPP_DEBUG) {
           try { 
-            console.log(JSON.stringify({ event: 'ignored', reason: 'empty', chatId, messageKeys: Object.keys(msg.message || {}) })); 
+            console.log(JSON.stringify({ event: 'ignored', reason: 'empty', chatId, messageKeys: Object.keys(messageContent || {}) })); 
           } catch (err) {
             console.error('Failed to log empty message event:', err);
           }

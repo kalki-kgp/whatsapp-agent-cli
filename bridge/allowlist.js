@@ -73,6 +73,16 @@ export function matchesAllowedUser(senderId, allowedUsers, sessionDir) {
     if (allowedUsers.has(alias)) {
       return true;
     }
+
+    // Be tolerant when operators enter a national-format number without
+    // country code, while WhatsApp exposes the sender as E.164 digits.
+    if (/^\d{8,15}$/.test(alias)) {
+      for (const allowed of allowedUsers) {
+        if (/^\d{8,15}$/.test(allowed) && alias.endsWith(allowed)) {
+          return true;
+        }
+      }
+    }
   }
 
   return false;

@@ -32,7 +32,8 @@ bash scripts/install.sh
 
 The installer will:
 
-- ask which backend you want to control (`codex` or `claude`)
+- show menu-based setup choices for backend, WhatsApp mode, defaults, and pairing
+- ask you to type only the machine-specific values such as the allowed phone number
 - install Python and Node dependencies
 - write `.env`
 - install a user `systemd` service

@@ -18,6 +18,13 @@ prompt_default() {
   fi
 }
 
+prompt_optional() {
+  local label="$1"
+  local answer
+  read -r -p "$label: " answer
+  printf '%s\n' "$answer"
+}
+
 prompt_yes_no() {
   local label="$1"
   local default_value="${2:-y}"
@@ -27,15 +34,73 @@ prompt_yes_no() {
   [[ "${answer,,}" =~ ^y(es)?$ ]]
 }
 
+choose_option() {
+  local label="$1"
+  local default_index="$2"
+  shift 2
+
+  local options=("$@")
+  local answer
+  local index
+
+  echo "$label" >&2
+  for index in "${!options[@]}"; do
+    printf '  %d) %s\n' "$((index + 1))" "${options[$index]}" >&2
+  done
+
+  while true; do
+    read -r -p "Select [$default_index]: " answer
+    answer="${answer:-$default_index}"
+    if [[ "$answer" =~ ^[0-9]+$ ]] && (( answer >= 1 && answer <= ${#options[@]} )); then
+      printf '%s\n' "${options[$((answer - 1))]}"
+      return
+    fi
+    echo "Pick a number from 1 to ${#options[@]}." >&2
+  done
+}
+
 choose_backend() {
-  local backend
-  backend="$(prompt_default 'Backend (codex/claude)' 'codex')"
-  backend="${backend,,}"
-  if [[ "$backend" != "codex" && "$backend" != "claude" ]]; then
-    echo "Invalid backend: $backend" >&2
+  choose_option "Backend" 1 "codex" "claude"
+}
+
+choose_mode() {
+  choose_option "WhatsApp mode" 1 "bot" "self-chat"
+}
+
+choose_path_value() {
+  local label="$1"
+  local default_value="$2"
+  local custom_label="${3:-Enter custom value}"
+  local selection
+  local custom_value
+
+  selection="$(choose_option "$label" 1 "Use default: $default_value" "$custom_label")"
+  if [[ "$selection" == "Use default: $default_value" ]]; then
+    printf '%s\n' "$default_value"
+    return
+  fi
+
+  custom_value="$(prompt_optional "$custom_label")"
+  if [[ -z "$custom_value" ]]; then
+    echo "A value is required." >&2
     exit 1
   fi
-  printf '%s\n' "$backend"
+  printf '%s\n' "$custom_value"
+}
+
+choose_optional_value() {
+  local label="$1"
+  local default_value="$2"
+  local custom_label="${3:-Enter custom value}"
+  local selection
+
+  selection="$(choose_option "$label" 1 "Use default: $default_value" "$custom_label")"
+  if [[ "$selection" == "Use default: $default_value" ]]; then
+    printf '%s\n' "$default_value"
+    return
+  fi
+
+  prompt_optional "$custom_label"
 }
 
 ensure_uv() {
@@ -96,20 +161,27 @@ install_service() {
 
 main() {
   local backend mode allowed_users root port agent_command default_command model
+  local model_choice
 
   backend="$(choose_backend)"
-  mode="$(prompt_default 'WhatsApp mode (bot/self-chat)' 'bot')"
-  allowed_users="$(prompt_default 'Allowed users (comma-separated phone/LID ids)' '')"
-  root="$(prompt_default 'Default working root' "$HOME")"
-  port="$(prompt_default 'Bridge port' '3010')"
+  mode="$(choose_mode)"
+  allowed_users="$(prompt_optional 'Allowed users (comma-separated phone/LID ids, usually your full number with country code)')"
+  root="$(choose_path_value 'Default working root' "$HOME" 'Enter custom working root')"
+  port="$(choose_optional_value 'Bridge port' '3010' 'Enter custom bridge port')"
 
   if [[ "$backend" == "codex" ]]; then
     default_command="${CODEX_COMMAND:-codex}"
   else
     default_command="${CLAUDE_COMMAND:-$HOME/.local/bin/claude}"
   fi
-  agent_command="$(prompt_default 'CLI command path' "$default_command")"
-  model="$(prompt_default 'Default model (leave blank for CLI default)' '')"
+  agent_command="$(choose_path_value 'CLI command path' "$default_command" 'Enter custom CLI command path')"
+
+  model_choice="$(choose_option 'Default model' 1 'Use CLI default' 'Set a model explicitly')"
+  if [[ "$model_choice" == 'Use CLI default' ]]; then
+    model=""
+  else
+    model="$(prompt_optional 'Enter model name')"
+  fi
 
   mkdir -p "$INSTALL_DIR"
   clone_or_update_repo
