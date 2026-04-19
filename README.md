@@ -1,106 +1,184 @@
-# CLI WhatsApp Bridge
+# whatsapp-agent
 
 Run a coding CLI behind a dedicated WhatsApp number.
 
-## What it does
+`whatsapp-agent` installs a WhatsApp bridge on a server, connects it to a local CLI agent, and keeps per-chat session state so you can message your server like a real operator instead of SSHing in every time.
 
-- Runs a Baileys-based WhatsApp bridge on the server
-- Lets you choose a backend during install:
+## Features
+
+- Supports multiple backends:
   - `codex`
   - `claude`
-- Maps each WhatsApp chat to a persistent backend session
-- Sends replies back through WhatsApp
-- Supports gateway commands:
-- `/status`
-- `/new`, `/clear`, `/reset`
-- `/resume [name]`
-- `/title <name>`
-- `/root /path`
-- `/model <name>`
-- `/compact`
-- `/help`
+- Guided installer with menu-based setup for the common choices
+- Dedicated WhatsApp bridge using Baileys
+- Persistent per-chat agent sessions
+- Per-chat root, model, title, saved sessions, and compacted summaries
+- `systemd --user` service for long-running deployment
+- Isolated WhatsApp setup that does not need to reuse your existing Telegram or other agent integrations
+
+## How it works
+
+The package runs two pieces:
+
+- `bridge/bridge.js`
+  Connects to WhatsApp and exposes a small local HTTP bridge.
+- `server/gateway.py`
+  Polls the bridge for incoming messages, routes each chat into the selected CLI backend, and sends replies back to WhatsApp.
+
+Each WhatsApp chat gets its own persisted session state, so one chat can stay pointed at one repo while another chat works somewhere else.
+
+## Supported backends
+
+- `codex`
+- `claude`
+
+The installer asks which backend you want to control. The selected CLI must already be installed and authenticated on the server.
+
+## Requirements
+
+- Linux server with `systemd --user`
+- Node.js 18+
+- Python 3.11+ or `uv`
+- One of:
+  - `codex`
+  - `claude`
+- A WhatsApp account or number to pair with the bridge
 
 ## Install
 
-Clone the repo and run the installer:
-
 ```bash
-git clone https://github.com/kalki-kgp/codex-whatsapp.git
-cd codex-whatsapp
+git clone https://github.com/kalki-kgp/whatsapp-agent.git
+cd whatsapp-agent
 bash scripts/install.sh
 ```
 
 The installer will:
 
-- show menu-based setup choices for backend, WhatsApp mode, defaults, and pairing
-- ask you to type only the machine-specific values such as the allowed phone number
+- ask which backend to use
+- ask whether to run in `bot` mode or `self-chat` mode
+- let you choose defaults or custom values for root, CLI path, model, and port
+- ask for your allowed WhatsApp number or numbers
 - install Python and Node dependencies
 - write `.env`
-- install a user `systemd` service
+- install a user service
 - offer to pair WhatsApp immediately
 
-By default it installs into `~/.agent-whatsapp` and uses the service name `agent-whatsapp.service`.
+By default, the runtime is installed into `~/.agent-whatsapp` and the service is named `agent-whatsapp.service`.
 
-## Layout
+## Pairing
 
-- `bridge/` - Node WhatsApp bridge
-- `server/gateway.py` - long-running backend-neutral gateway
-- `scripts/install.sh` - guided installer
-- `scripts/pair.sh` - QR pairing helper
-- `systemd/agent-whatsapp.service` - generic user service unit
-
-## Requirements
-
-- Node.js 18+
-- Python 3.11+ or `uv`
-- `codex` or `claude` installed and authenticated on the server
-- A WhatsApp account/number to pair with the bridge
-
-## Quick start
-
-```bash
-bash scripts/install.sh
-```
-
-Pair WhatsApp:
+If you skip pairing during install, run:
 
 ```bash
 bash ~/.agent-whatsapp/scripts/pair.sh
 ```
 
-Run the gateway:
+That prints a QR code in the terminal. Scan it with WhatsApp and the session will be stored under:
 
 ```bash
-bash ~/.agent-whatsapp/scripts/start.sh
+~/.agent-whatsapp/whatsapp/session
 ```
 
-If port `3000` is already taken on your box, set `WHATSAPP_PORT` in `.env` to something else like `3010`.
+## Running
 
-## systemd user service
-
-The installer copies `systemd/agent-whatsapp.service` to `~/.config/systemd/user/agent-whatsapp.service`, then reloads `systemd`.
+Start the service:
 
 ```bash
-systemctl --user daemon-reload
-systemctl --user enable --now agent-whatsapp.service
+systemctl --user start agent-whatsapp.service
 ```
 
-The unit expects the project at `~/.agent-whatsapp` by default.
+Check status:
+
+```bash
+systemctl --user status agent-whatsapp.service --no-pager
+```
+
+Inspect logs:
+
+```bash
+journalctl --user -u agent-whatsapp.service -n 100 --no-pager
+```
+
+Stop it:
+
+```bash
+systemctl --user stop agent-whatsapp.service
+```
+
+## Configuration
+
+The installer writes `~/.agent-whatsapp/.env`.
+
+Important settings:
+
+- `AGENT_BACKEND`
+  `codex` or `claude`
+- `AGENT_COMMAND`
+  Path or command name for the selected CLI
+- `AGENT_MODEL`
+  Optional default model
+- `AGENT_ROOT`
+  Default working directory
+- `WHATSAPP_MODE`
+  `bot` or `self-chat`
+- `WHATSAPP_ALLOWED_USERS`
+  Comma-separated phone numbers or WhatsApp IDs allowed to talk to the bridge
+- `WHATSAPP_PORT`
+  Local bridge port
+
+For allowlisting, full international format is the safest, for example:
+
+```env
+WHATSAPP_ALLOWED_USERS=917385166726
+```
+
+The bridge is also tolerant of common suffix-only input and LID mappings, but full country-code format is still the cleanest option.
 
 ## Chat commands
 
-- `/status` shows the active root, model, thread id, summary state, and saved session count.
-- `/root /absolute/path` switches the working directory for this chat and clears the active live thread.
-- `/model gpt-5.4` switches the model for this chat.
-- `/title My Repo Fix` names the current session so `/resume` is usable.
-- `/resume` lists saved sessions for the current chat.
-- `/resume My Repo Fix` restores that saved session.
-- `/new`, `/clear`, `/reset` archive the current session and start clean.
-- `/compact` stores a compact carry-forward summary and clears the live thread.
+- `/status`
+  Show backend, root, active thread, model, summary state, and saved-session count.
+- `/new`
+  Archive the current session and start fresh.
+- `/clear`
+  Same behavior as `/new`.
+- `/reset`
+  Clear the live session immediately.
+- `/resume`
+  List saved sessions for the current chat.
+- `/resume <name>`
+  Restore a saved session by name.
+- `/title <name>`
+  Name the current session.
+- `/root /absolute/path`
+  Change the working directory for the current chat.
+- `/model <name>`
+  Change the model for the current chat.
+- `/compact`
+  Roll the current conversation into a carry-forward summary and clear the live thread.
+- `/help`
+  Show the command list.
+
+## Repository layout
+
+- `bridge/`
+  Node-based WhatsApp bridge
+- `server/`
+  Python gateway that manages sessions and CLI execution
+- `scripts/install.sh`
+  Guided install flow
+- `scripts/pair.sh`
+  Pairing helper
+- `scripts/start.sh`
+  Service start helper
+- `scripts/stop.sh`
+  Service stop helper
+- `systemd/agent-whatsapp.service`
+  User service unit template
 
 ## Notes
 
-- The service expects the chosen backend to already be authenticated on the machine.
-- The WhatsApp session lives under `~/.agent-whatsapp/whatsapp/session` on a default install.
-- The default working root is controlled by `AGENT_ROOT`.
-- `.env` is intentionally gitignored. Use `.env.example` as the template.
+- This project is designed to run as an isolated WhatsApp control layer for coding CLIs.
+- It does not need to attach itself to your existing Telegram setup or other local agent workflows.
+- `.env` is intentionally not committed.
+- If you wipe `~/.agent-whatsapp`, you also wipe the saved WhatsApp session and will need to pair again.
