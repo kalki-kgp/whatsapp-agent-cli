@@ -52,18 +52,27 @@ cd whatsapp-agent
 bash scripts/install.sh
 ```
 
-The installer will:
+The installer is an interactive TUI (arrow keys to pick, Enter to confirm). It will:
 
-- ask which backend to use
-- ask whether to run in `bot` mode or `self-chat` mode
-- let you choose defaults or custom values for root, CLI path, model, and port
-- ask for your allowed WhatsApp number or numbers
-- install Python and Node dependencies
-- write `.env`
-- install a user service
+- auto-detect `claude` and `codex` on your `PATH` and pick one
+- ask whether to run in `bot` or `self-chat` mode
+- ask for your allowed WhatsApp number(s)
+- pick the next free bridge port starting at `3010`
+- hide root / model / port / CLI-path behind an opt-in **Advanced** toggle
+- show a review screen, then install Python + Node deps, write `.env`, and install the user service
 - offer to pair WhatsApp immediately
 
 By default, the runtime is installed into `~/.agent-whatsapp` and the service is named `agent-whatsapp.service`.
+
+### Installer flags
+
+```bash
+bash scripts/install.sh --reconfigure      # re-run prompts using values from existing .env as defaults
+bash scripts/install.sh --non-interactive  # no prompts; uses env vars + auto-detect (CI-friendly)
+bash scripts/install.sh --help             # full flag + env-var reference
+```
+
+In `--non-interactive` mode the only required input is `WHATSAPP_ALLOWED_USERS`. Everything else falls back to auto-detection or the saved `.env`.
 
 ## Pairing
 
