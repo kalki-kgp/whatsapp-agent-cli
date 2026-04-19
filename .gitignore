@@ -10,3 +10,9 @@ whatsapp/
 image_cache/
 audio_cache/
 document_cache/
+
+# build artifacts
+dist/
+build/
+*.egg-info/
+src/whatsapp_agent/_runtime/

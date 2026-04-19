@@ -361,6 +361,15 @@ ensure_uv() {
 }
 
 clone_or_update_repo() {
+  # Skip cloning when the runtime is already populated (e.g. when the
+  # python-package wrapper has copied bundled files into INSTALL_DIR), or
+  # when the caller explicitly asks to skip.
+  if [[ "${SKIP_CLONE:-0}" == "1" ]]; then
+    return 0
+  fi
+  if [[ -f "$INSTALL_DIR/bridge/bridge.js" ]]; then
+    return 0
+  fi
   if [[ -d "$INSTALL_DIR/.git" ]]; then
     git -C "$INSTALL_DIR" pull --ff-only
   else

@@ -46,13 +46,42 @@ The installer asks which backend you want to control. The selected CLI must alre
 
 ## Install
 
+### Quick install (PyPI)
+
 ```bash
-git clone https://github.com/kalki-kgp/whatsapp-agent.git
-cd whatsapp-agent
+# zero-install run with uv
+uvx whatsapp-agent-cli install
+
+# or as a persistent tool
+uv tool install whatsapp-agent-cli
+whatsapp-agent install
+
+# or classic pip
+pip install whatsapp-agent-cli
+whatsapp-agent install
+```
+
+The CLI exposes:
+
+```bash
+whatsapp-agent install [--reconfigure] [--non-interactive]
+whatsapp-agent pair                          # re-pair WhatsApp (prints QR)
+whatsapp-agent run                           # foreground gateway (no systemd)
+whatsapp-agent service start|stop|status|restart|logs
+whatsapp-agent doctor                        # diagnose the install
+whatsapp-agent path                          # print the install dir
+whatsapp-agent --version
+```
+
+### From source
+
+```bash
+git clone https://github.com/kalki-kgp/whatsapp-agent-cli.git
+cd whatsapp-agent-cli
 bash scripts/install.sh
 ```
 
-The installer is an interactive TUI (arrow keys to pick, Enter to confirm). It will:
+Both paths run the same interactive TUI (arrow keys to pick, Enter to confirm). It will:
 
 - auto-detect `claude` and `codex` on your `PATH` and pick one
 - ask whether to run in `bot` or `self-chat` mode

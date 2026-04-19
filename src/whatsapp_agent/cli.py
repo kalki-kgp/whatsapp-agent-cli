@@ -1,0 +1,296 @@
+"""whatsapp-agent CLI — thin wrapper around the bundled bash + node runtime."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+from importlib.resources import as_file, files
+from pathlib import Path
+from typing import Iterable
+
+from . import __version__
+
+DEFAULT_INSTALL_DIR = Path(os.environ.get("AGENT_WHATSAPP_HOME", str(Path.home() / ".agent-whatsapp")))
+DEFAULT_SERVICE_NAME = os.environ.get("SERVICE_NAME", "agent-whatsapp")
+
+# Files / dirs at the destination that must NEVER be overwritten by sync.
+PRESERVE = {".env", ".venv", "node_modules", "whatsapp", "state.json", "logs"}
+
+GREEN = "\033[38;2;37;211;102m"
+RED = "\033[31m"
+YELLOW = "\033[33m"
+DIM = "\033[2m"
+BOLD = "\033[1m"
+RESET = "\033[0m"
+
+if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
+    GREEN = RED = YELLOW = DIM = BOLD = RESET = ""
+
+
+def _ok(msg: str) -> None:
+    print(f"  {GREEN}✓{RESET} {msg}")
+
+
+def _warn(msg: str) -> None:
+    print(f"  {YELLOW}!{RESET} {msg}")
+
+
+def _fail(msg: str) -> None:
+    print(f"  {RED}✗{RESET} {msg}")
+
+
+def _runtime_root() -> Path:
+    """Return the on-disk path to the bundled runtime files inside the wheel."""
+    return Path(str(files("whatsapp_agent") / "_runtime"))
+
+
+def _sync_runtime(dest: Path) -> None:
+    """Copy bundled runtime into ``dest``, preserving user state."""
+    src = _runtime_root()
+    if not src.exists():
+        raise SystemExit(
+            f"Bundled runtime not found at {src}. "
+            "This wheel is missing data files — please reinstall."
+        )
+
+    dest.mkdir(parents=True, exist_ok=True)
+
+    for path in src.rglob("*"):
+        rel = path.relative_to(src)
+        if rel.parts and rel.parts[0] in PRESERVE:
+            continue
+        if any(part in {"node_modules", "__pycache__", ".venv"} for part in rel.parts):
+            continue
+
+        target = dest / rel
+        if path.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, target)
+            if target.suffix == ".sh":
+                target.chmod(0o755)
+
+
+def _exec_bash(script: Path, args: Iterable[str], env: dict | None = None) -> int:
+    """Run a bash script, inheriting stdio. Returns exit code."""
+    if not script.exists():
+        _fail(f"Script not found: {script}")
+        return 1
+    cmd = ["bash", str(script), *args]
+    full_env = os.environ.copy()
+    if env:
+        full_env.update(env)
+    return subprocess.call(cmd, env=full_env)
+
+
+# ── subcommands ──────────────────────────────────────────────────────────────
+
+
+def cmd_install(args: argparse.Namespace) -> int:
+    install_dir = Path(args.install_dir or DEFAULT_INSTALL_DIR)
+    install_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"  {DIM}Syncing bundled runtime → {install_dir}{RESET}")
+    _sync_runtime(install_dir)
+    _ok("runtime files in place")
+
+    script = install_dir / "scripts" / "install.sh"
+    forwarded: list[str] = []
+    if args.reconfigure:
+        forwarded.append("--reconfigure")
+    if args.non_interactive:
+        forwarded.append("--non-interactive")
+
+    env = {
+        "INSTALL_DIR": str(install_dir),
+        "SERVICE_NAME": args.service or DEFAULT_SERVICE_NAME,
+        "SKIP_CLONE": "1",
+    }
+    return _exec_bash(script, forwarded, env=env)
+
+
+def cmd_pair(args: argparse.Namespace) -> int:
+    install_dir = Path(args.install_dir or DEFAULT_INSTALL_DIR)
+    script = install_dir / "scripts" / "pair.sh"
+    if not script.exists():
+        _fail(f"Pair script not found at {script}.")
+        _warn("Run `whatsapp-agent install` first.")
+        return 1
+    return _exec_bash(script, [], env={"AGENT_WHATSAPP_HOME": str(install_dir)})
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    install_dir = Path(args.install_dir or DEFAULT_INSTALL_DIR)
+    venv_python = install_dir / ".venv" / "bin" / "python"
+    gateway = install_dir / "server" / "gateway.py"
+
+    if not venv_python.exists():
+        _fail(f"Runtime venv not found at {venv_python}.")
+        _warn("Run `whatsapp-agent install` first.")
+        return 1
+    if not gateway.exists():
+        _fail(f"gateway.py missing at {gateway}.")
+        return 1
+
+    env = os.environ.copy()
+    env["AGENT_WHATSAPP_HOME"] = str(install_dir)
+    env_file = install_dir / ".env"
+    if env_file.exists():
+        env["AGENT_ENV_FILE"] = str(env_file)
+
+    return subprocess.call([str(venv_python), str(gateway)], env=env, cwd=str(install_dir))
+
+
+def cmd_service(args: argparse.Namespace) -> int:
+    if shutil.which("systemctl") is None:
+        _fail("systemctl not found — service control is Linux-only.")
+        _warn("Use `whatsapp-agent run` to run the gateway in the foreground.")
+        return 1
+
+    service = f"{args.service or DEFAULT_SERVICE_NAME}.service"
+    verb = args.verb
+
+    if verb == "logs":
+        cmd = ["journalctl", "--user", "-u", service, "-f"]
+    else:
+        flags: list[str] = []
+        if verb == "status":
+            flags = ["--no-pager"]
+        cmd = ["systemctl", "--user", verb, service, *flags]
+
+    return subprocess.call(cmd)
+
+
+def _parse_env_file(path: Path) -> dict[str, str]:
+    out: dict[str, str] = {}
+    if not path.exists():
+        return out
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        out[k.strip()] = v.strip()
+    return out
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    install_dir = Path(args.install_dir or DEFAULT_INSTALL_DIR)
+    print(f"\n  {BOLD}whatsapp-agent doctor{RESET}  {DIM}({install_dir}){RESET}\n")
+
+    failures = 0
+
+    def check(label: str, ok: bool, detail: str = "") -> None:
+        nonlocal failures
+        suffix = f"  {DIM}{detail}{RESET}" if detail else ""
+        if ok:
+            _ok(f"{label}{suffix}")
+        else:
+            _fail(f"{label}{suffix}")
+            failures += 1
+
+    py_ok = sys.version_info >= (3, 10)
+    check("python ≥ 3.10", py_ok, f"found {sys.version.split()[0]}")
+    check("uv on PATH", shutil.which("uv") is not None, shutil.which("uv") or "missing")
+    node = shutil.which("node")
+    check("node on PATH", node is not None, node or "missing")
+
+    install_ok = (install_dir / "bridge" / "bridge.js").exists()
+    check("install dir populated", install_ok, str(install_dir))
+
+    env_path = install_dir / ".env"
+    env = _parse_env_file(env_path)
+    check(".env present", env_path.exists(), str(env_path))
+
+    backend = env.get("AGENT_BACKEND", "")
+    check("AGENT_BACKEND set", bool(backend), backend or "(empty)")
+
+    cli_path = env.get("AGENT_COMMAND", "")
+    cli_exists = bool(cli_path) and Path(cli_path).exists()
+    check("CLI binary exists", cli_exists, cli_path or "(empty)")
+
+    allowed = env.get("WHATSAPP_ALLOWED_USERS", "").strip()
+    check("WHATSAPP_ALLOWED_USERS set", bool(allowed), allowed or "(empty)")
+
+    venv_py = install_dir / ".venv" / "bin" / "python"
+    check("python venv built", venv_py.exists(), str(venv_py))
+
+    bridge_modules = install_dir / "bridge" / "node_modules"
+    check("bridge node_modules", bridge_modules.exists(), str(bridge_modules))
+
+    print()
+    if failures == 0:
+        _ok(f"{BOLD}all good.{RESET}")
+        return 0
+    _fail(f"{failures} check(s) failed. Run `whatsapp-agent install` to fix.")
+    return 1
+
+
+def cmd_path(args: argparse.Namespace) -> int:
+    print(args.install_dir or DEFAULT_INSTALL_DIR)
+    return 0
+
+
+# ── argparse wiring ──────────────────────────────────────────────────────────
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="whatsapp-agent",
+        description="Run a coding CLI (claude / codex) behind a dedicated WhatsApp number.",
+    )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    parser.add_argument(
+        "--install-dir",
+        default=None,
+        metavar="PATH",
+        help=f"Override install root (default: {DEFAULT_INSTALL_DIR}).",
+    )
+
+    sub = parser.add_subparsers(dest="cmd", metavar="<command>")
+    sub.required = True
+
+    p_install = sub.add_parser("install", help="Install / reconfigure the runtime (interactive).")
+    p_install.add_argument("--reconfigure", action="store_true",
+                           help="Re-run prompts using saved .env values as defaults.")
+    p_install.add_argument("--non-interactive", action="store_true",
+                           help="No prompts; use env vars + auto-detect.")
+    p_install.add_argument("--service", default=None, help="systemd user service name.")
+    p_install.set_defaults(func=cmd_install)
+
+    p_pair = sub.add_parser("pair", help="Re-pair WhatsApp (prints QR in the terminal).")
+    p_pair.set_defaults(func=cmd_pair)
+
+    p_run = sub.add_parser("run", help="Run the gateway in the foreground (no systemd).")
+    p_run.set_defaults(func=cmd_run)
+
+    p_svc = sub.add_parser("service", help="Control the systemd user service.")
+    p_svc.add_argument("verb",
+                       choices=["start", "stop", "restart", "status",
+                                "enable", "disable", "logs"],
+                       help="Action to perform.")
+    p_svc.add_argument("--service", default=None, help="systemd user service name.")
+    p_svc.set_defaults(func=cmd_service)
+
+    p_doc = sub.add_parser("doctor", help="Run diagnostics on the install.")
+    p_doc.set_defaults(func=cmd_doctor)
+
+    p_path = sub.add_parser("path", help="Print the install dir.")
+    p_path.set_defaults(func=cmd_path)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return args.func(args)
+    except KeyboardInterrupt:
+        print()
+        _fail("cancelled.")
+        return 130
