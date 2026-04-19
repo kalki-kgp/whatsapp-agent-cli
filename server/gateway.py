@@ -575,9 +575,7 @@ class CodexWhatsAppGateway:
             args.extend(["resume", "--json"])
         else:
             args.extend(["--json", "--skip-git-repo-check", "-C", str(root)])
-        args.extend(
-            ["--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "-o", str(out_path)]
-        )
+        args.extend(["--dangerously-bypass-approvals-and-sandbox", "-o", str(out_path)])
         selected_model = (chat_state.get("model") or self.config.model).strip()
         if selected_model:
             args.extend(["-m", selected_model])
