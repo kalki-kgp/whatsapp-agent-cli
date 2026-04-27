@@ -156,6 +156,12 @@ class Config:
         self.memory_rollover_time = parse_daily_time(self.memory_rollover_time_text)
         self.memory_check_interval = float(os.getenv("AGENT_MEMORY_CHECK_INTERVAL", "60"))
         self.memory_files = _env_list("AGENT_MEMORY_FILES", DEFAULT_MEMORY_FILES)
+        self.transcribe_audio = _env_flag("AGENT_TRANSCRIBE_AUDIO", default=False)
+        self.whisper_model = _env_first("AGENT_WHISPER_MODEL", default="base")
+        self.whisper_device = _env_first("AGENT_WHISPER_DEVICE", default="cpu")
+        self.whisper_compute_type = _env_first("AGENT_WHISPER_COMPUTE_TYPE", default="int8")
+        self.whisper_language = _env_first("AGENT_WHISPER_LANGUAGE", default="")
+        self.whisper_beam_size = int(os.getenv("AGENT_WHISPER_BEAM_SIZE", "5"))
 
     def ensure_dirs(self) -> None:
         paths = [self.home, self.logs_dir, self.session_dir.parent]
@@ -229,6 +235,8 @@ def split_message(text: str, limit: int) -> list[str]:
 
 def build_prompt(event: dict[str, Any], root: str) -> tuple[str, list[str]]:
     body = (event.get("body") or "").strip()
+    transcription_text = (event.get("transcriptionText") or "").strip()
+    transcription_error = (event.get("transcriptionError") or "").strip()
     media_urls = event.get("mediaUrls") or []
     media_type = event.get("mediaType") or ""
     image_args: list[str] = []
@@ -238,6 +246,15 @@ def build_prompt(event: dict[str, Any], root: str) -> tuple[str, list[str]]:
         if media_type == "image" and path.exists():
             image_args.extend(["-i", str(path)])
         media_lines.append(f"- {media_type or 'file'}: {path}")
+
+    user_message = body or "[no text]"
+    if transcription_text:
+        if not body or body in {"[audio received]", "[ptt received]"}:
+            user_message = "[voice message transcription]\n" + transcription_text
+        else:
+            user_message = body + "\n\nVoice message transcription:\n" + transcription_text
+    elif transcription_error:
+        user_message = user_message + "\n\nVoice transcription failed:\n" + transcription_error
 
     prompt = (
         "You are replying to a WhatsApp user through a server-side CLI coding agent gateway.\n"
@@ -251,7 +268,7 @@ def build_prompt(event: dict[str, Any], root: str) -> tuple[str, list[str]]:
         "Treat the content below as the user's actual message.\n"
         "\n"
         "User message:\n"
-        f"{body or '[no text]'}\n"
+        f"{user_message}\n"
     )
     if media_lines:
         prompt += "\nAttached/cached media:\n" + "\n".join(media_lines) + "\n"
@@ -551,6 +568,8 @@ class WhatsAppAgentGateway:
         self.upgrade_notice = ""
         self.last_upgrade_check = 0.0
         self.memory_task: asyncio.Task[Any] | None = None
+        self.whisper_model: Any | None = None
+        self.whisper_lock = asyncio.Lock()
 
     def upgrade_command(self) -> str:
         install_dir = shlex.quote(str(self.config.home))
@@ -692,6 +711,13 @@ class WhatsAppAgentGateway:
     async def process_message(self, event: dict[str, Any]) -> None:
         chat_id = str(event["chatId"])
         body = (event.get("body") or "").strip()
+        LOG.info(
+            "Incoming message chat=%s sender=%s media=%s body=%s",
+            chat_id,
+            event.get("senderName") or event.get("senderId") or "(unknown)",
+            event.get("mediaType") or "text",
+            body[:300].replace("\n", " "),
+        )
         if body.startswith("/"):
             handled = await self.handle_gateway_command(chat_id, body)
             if handled:
@@ -699,6 +725,8 @@ class WhatsAppAgentGateway:
 
         chat_state = self.state.chat(chat_id)
         root = chat_state.get("root", self.state.default_root)
+        if self.config.transcribe_audio:
+            await self.attach_audio_transcription(event)
         await self.start_typing(chat_id)
         try:
             reply, thread_id = await self.run_agent(event, chat_state, root)
@@ -715,7 +743,82 @@ class WhatsAppAgentGateway:
 
         reply = await self.add_upgrade_notice(reply, chat_state)
         for chunk in split_message(reply, self.config.max_reply_chars):
+            LOG.info("Sending reply chat=%s body=%s", chat_id, chunk[:300].replace("\n", " "))
             await self.send_message(chat_id, chunk)
+
+    def audio_paths_from_event(self, event: dict[str, Any]) -> list[Path]:
+        media_type = str(event.get("mediaType") or "").lower()
+        if media_type not in {"audio", "ptt"}:
+            return []
+        paths: list[Path] = []
+        for media_path in event.get("mediaUrls") or []:
+            path = Path(str(media_path))
+            if path.exists():
+                paths.append(path)
+        return paths
+
+    async def attach_audio_transcription(self, event: dict[str, Any]) -> None:
+        paths = self.audio_paths_from_event(event)
+        if not paths:
+            return
+        transcripts: list[str] = []
+        errors: list[str] = []
+        for path in paths:
+            try:
+                transcript = await self.transcribe_audio_file(path)
+                if transcript:
+                    transcripts.append(transcript)
+            except Exception as exc:
+                LOG.exception("Audio transcription failed for %s", path)
+                errors.append(f"{path.name}: {exc}")
+        if transcripts:
+            event["transcriptionText"] = "\n\n".join(transcripts)
+            LOG.info(
+                "Transcribed audio chat=%s text=%s",
+                event.get("chatId"),
+                event["transcriptionText"][:300].replace("\n", " "),
+            )
+        if errors:
+            event["transcriptionError"] = "\n".join(errors)
+
+    async def transcribe_audio_file(self, path: Path) -> str:
+        async with self.whisper_lock:
+            return await asyncio.to_thread(self._transcribe_audio_file_sync, path)
+
+    def _transcribe_audio_file_sync(self, path: Path) -> str:
+        try:
+            from faster_whisper import WhisperModel
+        except ImportError as exc:
+            raise RuntimeError(
+                "faster-whisper is not installed. Re-run `whatsapp-agent install --reconfigure` "
+                "and enable voice transcription."
+            ) from exc
+
+        if self.whisper_model is None:
+            LOG.info(
+                "Loading faster-whisper model=%s device=%s compute_type=%s",
+                self.config.whisper_model,
+                self.config.whisper_device,
+                self.config.whisper_compute_type,
+            )
+            self.whisper_model = WhisperModel(
+                self.config.whisper_model,
+                device=self.config.whisper_device,
+                compute_type=self.config.whisper_compute_type,
+            )
+
+        language = self.config.whisper_language or None
+        segments, info = self.whisper_model.transcribe(
+            str(path),
+            language=language,
+            beam_size=self.config.whisper_beam_size,
+        )
+        text = " ".join(segment.text.strip() for segment in segments if segment.text.strip())
+        detected = getattr(info, "language", "") or ""
+        probability = getattr(info, "language_probability", 0.0) or 0.0
+        if detected:
+            LOG.info("Detected audio language=%s probability=%.2f file=%s", detected, probability, path)
+        return text.strip()
 
     async def add_upgrade_notice(self, reply: str, chat_state: dict[str, Any]) -> str:
         await self.refresh_upgrade_notice()

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
 import sys
+import time
 from importlib.resources import files
 from pathlib import Path
 from typing import Iterable
@@ -161,10 +163,29 @@ def cmd_run(args: argparse.Namespace) -> int:
     env = os.environ.copy()
     env["AGENT_WHATSAPP_HOME"] = str(install_dir)
     env_file = install_dir / ".env"
+    parsed_env: dict[str, str] = {}
     if env_file.exists():
         env["AGENT_ENV_FILE"] = str(env_file)
+        parsed_env = _parse_env_file(env_file)
 
-    return subprocess.call([str(venv_python), str(gateway)], env=env, cwd=str(install_dir))
+    if args.plain or not sys.stdout.isatty():
+        print("  whatsapp-agent gateway running in foreground. Press Ctrl-C to stop.")
+        return subprocess.call([str(venv_python), str(gateway)], env=env, cwd=str(install_dir))
+
+    logs_dir = install_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    gateway_log = logs_dir / "gateway.log"
+    with gateway_log.open("a", buffering=1) as log_handle:
+        log_handle.write(f"\n--- whatsapp-agent run started {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+        proc = subprocess.Popen(
+            [str(venv_python), str(gateway)],
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            env=env,
+            cwd=str(install_dir),
+            text=True,
+        )
+        return _run_monitor(proc, install_dir, parsed_env, gateway_log)
 
 
 def cmd_service(args: argparse.Namespace) -> int:
@@ -266,6 +287,129 @@ def _parse_env_file(path: Path) -> dict[str, str]:
     return out
 
 
+def _tail_lines(path: Path, limit: int = 60) -> list[str]:
+    if not path.exists():
+        return []
+    try:
+        lines = path.read_text(errors="replace").splitlines()
+    except Exception as exc:
+        return [f"Could not read {path}: {exc}"]
+    return lines[-limit:]
+
+
+def _state_lines(install_dir: Path, env: dict[str, str]) -> list[str]:
+    lines = [
+        f"home: {install_dir}",
+        f"backend: {env.get('AGENT_BACKEND', '(unset)')}",
+        f"model: {env.get('AGENT_MODEL') or '(cli default)'}",
+        f"root: {env.get('AGENT_ROOT', '(unset)')}",
+        f"mode: {env.get('WHATSAPP_MODE', '(unset)')}",
+        f"port: {env.get('WHATSAPP_PORT', '3010')}",
+        f"voice: {'on' if env.get('AGENT_TRANSCRIBE_AUDIO') == '1' else 'off'}",
+    ]
+    state_path = install_dir / "state.json"
+    if not state_path.exists():
+        lines.append("state: waiting for first message")
+        return lines
+    try:
+        state = json.loads(state_path.read_text())
+    except Exception as exc:
+        lines.append(f"state: unreadable ({exc})")
+        return lines
+    chats = state.get("chats") or {}
+    lines.append(f"chats: {len(chats)}")
+    for chat_id, chat_state in list(chats.items())[-5:]:
+        title = chat_state.get("title") or "(untitled)"
+        thread = chat_state.get("thread_id") or "(none)"
+        root = chat_state.get("root") or env.get("AGENT_ROOT") or "(unset)"
+        model = chat_state.get("model") or env.get("AGENT_MODEL") or "(default)"
+        lines.append(f"- {title} | {chat_id}")
+        lines.append(f"  id={thread} model={model} root={root}")
+    return lines
+
+
+def _draw_line(stdscr: object, y: int, x: int, text: str, width: int, attr: int = 0) -> None:
+    safe = text.replace("\t", "    ")
+    try:
+        stdscr.addnstr(y, x, safe.ljust(max(0, width - 1)), max(0, width - 1), attr)
+    except Exception:
+        pass
+
+
+def _run_monitor(proc: subprocess.Popen, install_dir: Path, env: dict[str, str], gateway_log: Path) -> int:
+    try:
+        import curses
+    except Exception:
+        _warn("curses is unavailable; falling back to plain foreground mode.")
+        return proc.wait()
+
+    bridge_log = install_dir / "logs" / "bridge.log"
+
+    def loop(stdscr: object) -> int:
+        curses.curs_set(0)
+        stdscr.nodelay(True)
+        stdscr.timeout(250)
+        selected = "gateway"
+        while True:
+            key = stdscr.getch()
+            if key in {ord("q"), ord("Q"), 3}:
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait()
+                return proc.returncode or 0
+            if key in {ord("g"), ord("G")}:
+                selected = "gateway"
+            if key in {ord("b"), ord("B")}:
+                selected = "bridge"
+
+            height, width = stdscr.getmaxyx()
+            stdscr.erase()
+            running = proc.poll() is None
+            title = "whatsapp-agent run"
+            status = "running" if running else f"exited {proc.returncode}"
+            _draw_line(stdscr, 0, 0, f" {title} [{status}]  q:quit  g:gateway  b:bridge", width, curses.A_REVERSE)
+
+            left_width = min(46, max(28, width // 3))
+            log_width = max(20, width - left_width - 3)
+            _draw_line(stdscr, 2, 1, "Session", left_width, curses.A_BOLD)
+            for idx, line in enumerate(_state_lines(install_dir, env)[: height - 5]):
+                _draw_line(stdscr, 3 + idx, 1, line, left_width)
+
+            for y in range(1, height):
+                _draw_line(stdscr, y, left_width + 1, "|", 2)
+
+            log_path = gateway_log if selected == "gateway" else bridge_log
+            _draw_line(stdscr, 2, left_width + 3, f"{selected} log: {log_path}", log_width, curses.A_BOLD)
+            log_lines = _tail_lines(log_path, max(5, height - 5))
+            start_y = 3
+            for idx, line in enumerate(log_lines[-(height - start_y - 1):]):
+                _draw_line(stdscr, start_y + idx, left_width + 3, line, log_width)
+            if not running:
+                _draw_line(
+                    stdscr,
+                    height - 1,
+                    0,
+                    " gateway exited; press q to close ",
+                    width,
+                    curses.A_REVERSE,
+                )
+            stdscr.refresh()
+            if not running:
+                time.sleep(0.5)
+
+    try:
+        return curses.wrapper(loop)
+    except KeyboardInterrupt:
+        if proc.poll() is None:
+            proc.terminate()
+            proc.wait()
+        return 130
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     install_dir = Path(args.install_dir or DEFAULT_INSTALL_DIR)
     print(f"\n  {BOLD}whatsapp-agent doctor{RESET}  {DIM}({install_dir}){RESET}\n")
@@ -306,6 +450,14 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     venv_py = install_dir / ".venv" / "bin" / "python"
     check("python venv built", venv_py.exists(), str(venv_py))
+    if env.get("AGENT_TRANSCRIBE_AUDIO") == "1" and venv_py.exists():
+        whisper_ok = subprocess.run(
+            [str(venv_py), "-c", "import faster_whisper"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        ).returncode == 0
+        check("faster-whisper installed", whisper_ok, env.get("AGENT_WHISPER_MODEL", "base"))
 
     bridge_modules = install_dir / "bridge" / "node_modules"
     check("bridge node_modules", bridge_modules.exists(), str(bridge_modules))
@@ -360,7 +512,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Do not prompt when --reset is selected.")
     p_pair.set_defaults(func=cmd_pair)
 
-    p_run = sub.add_parser("run", help="Run the gateway in the foreground (no systemd).")
+    p_run = sub.add_parser("run", help="Run the gateway with a live terminal monitor.")
+    p_run.add_argument("--plain", action="store_true",
+                       help="Use the old foreground log mode instead of the terminal monitor.")
     p_run.set_defaults(func=cmd_run)
 
     p_svc = sub.add_parser("service", help="Control the systemd user service.")

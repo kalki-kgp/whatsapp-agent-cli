@@ -70,6 +70,7 @@ The installer is an interactive TUI (arrow keys to pick, Enter to confirm). It w
 - auto-detect `claude` and `codex` on your `PATH` and pick one
 - ask whether to run in `bot` or `self-chat` mode
 - ask for your allowed WhatsApp number(s)
+- ask whether to install `faster-whisper` for WhatsApp voice-note transcription
 - pick the next free bridge port starting at `3010`
 - hide root / model / port / CLI-path behind an opt-in **Advanced** toggle
 - show a review screen, then install Python + Node deps, write `.env`, and install the user service
@@ -84,7 +85,7 @@ WHATSAPP_ALLOWED_USERS=919876543210 \ (Your WhatsApp number with country code)
   whatsapp-agent install --non-interactive
 ```
 
-Reads from env vars (`AGENT_BACKEND`, `AGENT_COMMAND`, `WHATSAPP_MODE`, `WHATSAPP_PORT`, `AGENT_ROOT`, `AGENT_MODEL`) and falls back to auto-detection. Only `WHATSAPP_ALLOWED_USERS` is mandatory.
+Reads from env vars (`AGENT_BACKEND`, `AGENT_COMMAND`, `WHATSAPP_MODE`, `WHATSAPP_PORT`, `AGENT_ROOT`, `AGENT_MODEL`, `AGENT_TRANSCRIBE_AUDIO`) and falls back to auto-detection. Only `WHATSAPP_ALLOWED_USERS` is mandatory.
 
 With the bootstrap installer:
 
@@ -126,7 +127,8 @@ whatsapp-agent install [--reconfigure] [--non-interactive]
                                     # prompts using saved .env as defaults
 whatsapp-agent pair [--reuse|--reset] [--yes]
                                     # pair, verify, or replace WhatsApp credentials
-whatsapp-agent run                  # foreground gateway (no systemd; macOS too)
+whatsapp-agent run                  # live terminal monitor for the gateway
+whatsapp-agent run --plain          # foreground gateway logs without the monitor
 whatsapp-agent service start        # systemd user service controls
 whatsapp-agent service stop
 whatsapp-agent service restart
@@ -182,6 +184,12 @@ Settings live in `~/.agent-whatsapp/.env`. Edit by hand or re-run `whatsapp-agen
 | `AGENT_MEMORY_DIR` | Memory root; each chat gets a folder containing `MEMORY.md` |
 | `AGENT_MEMORY_ROLLOVER_TIME` | Daily local time, `HH:MM`, to update memory and roll sessions forward |
 | `AGENT_MEMORY_FILES` | Comma-separated core memory files; default includes `user.md`, `career.md`, `projects.md`, `preferences.md`, `open-loops.md` |
+| `AGENT_TRANSCRIBE_AUDIO` | Set to `1` to transcribe WhatsApp audio/PTT messages before prompting the agent |
+| `AGENT_WHISPER_MODEL` | faster-whisper model name, default `base` |
+| `AGENT_WHISPER_DEVICE` | faster-whisper device, default `cpu` |
+| `AGENT_WHISPER_COMPUTE_TYPE` | faster-whisper compute type, default `int8` |
+| `AGENT_WHISPER_LANGUAGE` | Optional language code; blank lets Whisper auto-detect |
+| `AGENT_WHISPER_BEAM_SIZE` | Beam size for transcription, default `5` |
 | `AGENT_UPGRADE_CHECK` | Set to `0` to disable PyPI upgrade notices |
 | `AGENT_PACKAGE_VERSION` | Installed package version used for upgrade notices |
 | `SERVICE_NAME` | systemd user service name used by approved upgrades |
@@ -195,6 +203,10 @@ WHATSAPP_ALLOWED_USERS=917385166726, 14155551212
 The bridge also tolerates suffix-only input and resolves LID↔phone via `bridge/allowlist.js`, but country-code format is the cleanest.
 
 When the gateway sees a newer `whatsapp-agent-cli` release on PyPI, it appends an upgrade approval prompt to replies. Reply `/yes` to let the agent run the upgrade command in that same chat, or `/no` to dismiss that version.
+
+## Voice Notes
+
+If you enable voice transcription during install, the runtime venv installs `faster-whisper`. Incoming WhatsApp voice notes and audio messages are downloaded by the bridge, transcribed locally, and the transcript is inserted into the agent prompt before the backend runs. Re-run `whatsapp-agent install --reconfigure` to turn it on or off.
 
 ## Long-Term Memory
 

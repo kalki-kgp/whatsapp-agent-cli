@@ -56,6 +56,11 @@ Env vars consumed in --non-interactive mode (or as defaults):
   AGENT_MEMORY_ENABLED   1/0 toggle for long-term memory
   AGENT_MEMORY_ROLLOVER_TIME
                          daily local rollover time, HH:MM (default 04:00)
+  AGENT_TRANSCRIBE_AUDIO 1/0 toggle for voice-note transcription
+  AGENT_WHISPER_MODEL    faster-whisper model name (default base)
+  AGENT_WHISPER_DEVICE   cpu | cuda | auto (default cpu)
+  AGENT_WHISPER_COMPUTE_TYPE
+                         faster-whisper compute type (default int8)
   AGENT_PACKAGE_VERSION  installed whatsapp-agent-cli version
   AGENT_ROOT             default working directory
   WHATSAPP_MODE          bot | self-chat
@@ -408,6 +413,9 @@ install_python_deps() {
   uv venv --clear "$INSTALL_DIR/.venv" --python "$PYTHON_BIN"
   uv pip install --python "$INSTALL_DIR/.venv/bin/python" \
     -r "$INSTALL_DIR/requirements.txt"
+  if [[ "${TRANSCRIBE_AUDIO:-0}" == "1" ]]; then
+    uv pip install --python "$INSTALL_DIR/.venv/bin/python" faster-whisper
+  fi
 }
 
 install_node_deps() {
@@ -424,6 +432,12 @@ AGENT_MODEL=$MODEL
 AGENT_MEMORY_DIR=$MEMORY_DIR
 AGENT_MEMORY_ENABLED=$MEMORY_ENABLED
 AGENT_MEMORY_ROLLOVER_TIME=$MEMORY_ROLLOVER_TIME
+AGENT_TRANSCRIBE_AUDIO=$TRANSCRIBE_AUDIO
+AGENT_WHISPER_MODEL=$WHISPER_MODEL
+AGENT_WHISPER_DEVICE=$WHISPER_DEVICE
+AGENT_WHISPER_COMPUTE_TYPE=$WHISPER_COMPUTE_TYPE
+AGENT_WHISPER_LANGUAGE=$WHISPER_LANGUAGE
+AGENT_WHISPER_BEAM_SIZE=$WHISPER_BEAM_SIZE
 AGENT_PACKAGE_VERSION=$PACKAGE_VERSION
 AGENT_ROOT=$ROOT
 WHATSAPP_MODE=$MODE
@@ -459,11 +473,14 @@ advanced_menu() {
       "CLI command         ${DIM}·${RESET} $AGENT_COMMAND"
       "Memory dir          ${DIM}·${RESET} $MEMORY_DIR"
       "Memory rollover     ${DIM}·${RESET} $MEMORY_ROLLOVER_TIME"
+      "Whisper model       ${DIM}·${RESET} $WHISPER_MODEL"
+      "Whisper device      ${DIM}·${RESET} $WHISPER_DEVICE"
+      "Whisper compute     ${DIM}·${RESET} $WHISPER_COMPUTE_TYPE"
       "Done"
     )
     menu_select "Advanced settings" \
       "Pick a value to override; choose Done when finished." \
-      7 "${labels[@]}"
+      10 "${labels[@]}"
     case "$MENU_INDEX" in
       0) prompt_text "Working root" \
            "Default working directory for new chats." \
@@ -481,9 +498,18 @@ advanced_menu() {
            "Long-term memory root. Each WhatsApp chat gets its own folder." \
            "$MEMORY_DIR" validate_path && MEMORY_DIR="$PROMPT_RESULT" ;;
       5) prompt_text "Memory rollover time" \
-           "Daily local time to update memories and preload the next session summary." \
+           "Daily local time to update memories and compact the active session." \
            "$MEMORY_ROLLOVER_TIME" validate_time_hhmm && MEMORY_ROLLOVER_TIME="$PROMPT_RESULT" ;;
-      6) return ;;
+      6) prompt_text "Whisper model" \
+           "Examples: tiny, base, small, medium, large-v3. Smaller is faster." \
+           "$WHISPER_MODEL" validate_nonempty && WHISPER_MODEL="$PROMPT_RESULT" ;;
+      7) prompt_text "Whisper device" \
+           "Use cpu for most servers, cuda for a configured NVIDIA GPU." \
+           "$WHISPER_DEVICE" validate_nonempty && WHISPER_DEVICE="$PROMPT_RESULT" ;;
+      8) prompt_text "Whisper compute type" \
+           "Use int8 on CPU; float16 is common on CUDA." \
+           "$WHISPER_COMPUTE_TYPE" validate_nonempty && WHISPER_COMPUTE_TYPE="$PROMPT_RESULT" ;;
+      9) return ;;
     esac
   done
 }
@@ -504,6 +530,7 @@ print_summary() {
   printf '  %s│%s  %-16s %s\n' "$GREEN" "$RESET" "Model"         "$model_show"
   printf '  %s│%s  %-16s %s\n' "$GREEN" "$RESET" "Memory dir"    "$MEMORY_DIR"
   printf '  %s│%s  %-16s %s\n' "$GREEN" "$RESET" "Memory time"   "$MEMORY_ROLLOVER_TIME"
+  printf '  %s│%s  %-16s %s\n' "$GREEN" "$RESET" "Voice notes"   "$([[ "$TRANSCRIBE_AUDIO" == "1" ]] && printf 'transcribe (%s)' "$WHISPER_MODEL" || printf 'off')"
   printf '  %s│%s  %-16s %s\n' "$GREEN" "$RESET" "Install dir"   "$INSTALL_DIR"
   printf '  %s└──────────────────────────────────────────────%s\n' "$GREEN" "$RESET"
 }
@@ -589,7 +616,23 @@ main() {
   MEMORY_DIR="${AGENT_MEMORY_DIR:-$INSTALL_DIR/memory}"
   MEMORY_ENABLED="${AGENT_MEMORY_ENABLED:-1}"
   MEMORY_ROLLOVER_TIME="${AGENT_MEMORY_ROLLOVER_TIME:-04:00}"
+  TRANSCRIBE_AUDIO="${AGENT_TRANSCRIBE_AUDIO:-0}"
+  WHISPER_MODEL="${AGENT_WHISPER_MODEL:-base}"
+  WHISPER_DEVICE="${AGENT_WHISPER_DEVICE:-cpu}"
+  WHISPER_COMPUTE_TYPE="${AGENT_WHISPER_COMPUTE_TYPE:-int8}"
+  WHISPER_LANGUAGE="${AGENT_WHISPER_LANGUAGE:-}"
+  WHISPER_BEAM_SIZE="${AGENT_WHISPER_BEAM_SIZE:-5}"
   PACKAGE_VERSION="${AGENT_PACKAGE_VERSION:-}"
+
+  if [[ $INTERACTIVE -eq 1 ]]; then
+    if confirm "Transcribe WhatsApp voice messages?" \
+        "Installs faster-whisper into the runtime venv. Voice notes will be converted to text before reaching the agent." \
+        "$([[ "$TRANSCRIBE_AUDIO" == "1" ]] && printf 'y' || printf 'n')"; then
+      TRANSCRIBE_AUDIO=1
+    else
+      TRANSCRIBE_AUDIO=0
+    fi
+  fi
 
   PORT_AUTO=0
   if [[ -n "${WHATSAPP_PORT:-}" ]]; then
