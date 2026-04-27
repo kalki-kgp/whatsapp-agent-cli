@@ -155,7 +155,7 @@ Send these as WhatsApp messages from any allowed number:
 | `/reset` | Clear the live session immediately |
 | `/resume` | List the current session plus all saved sessions for this chat |
 | `/resume <name>` | Restore a saved session by name or id |
-| `/search-session <query>` | Find and resume the most relevant saved session |
+| `/search-session <query>` (or `/ss <query>`) | Find and resume the most relevant saved session |
 | `/title <name>` | Name the current session; this is the session name shown by `/resume` |
 | `/root /abs/path` | Change the working directory for this chat |
 | `/model <name>` | Change the model for future turns without clearing the session |

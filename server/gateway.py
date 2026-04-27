@@ -446,7 +446,7 @@ def format_saved_sessions(chat_state: dict[str, Any]) -> str:
         saved_at = entry.get("saved_at", "")[:16].replace("T", " ")
         lines.append(f"- {name} | id={thread_id} | model={model} | root={root} | {saved_at}")
     lines.append("Use `/resume <name>` or `/resume <id>` to switch back.")
-    lines.append("Use `/search-session <query>` when you only remember part of the work.")
+    lines.append("Use `/search-session <query>` or `/ss <query>` when you only remember part of the work.")
     return "\n".join(lines)
 
 
@@ -536,7 +536,7 @@ def format_chat_help() -> str:
         "/title <name> - name the current session; this name appears in /resume\n"
         "/resume - list the current session plus saved sessions\n"
         "/resume <name-or-id> - switch back to a saved session\n"
-        "/search-session <query> - find and resume the best matching saved session\n"
+        "/search-session <query> (or /ss <query>) - find and resume the best matching saved session\n"
         "/new - archive the current session and start a fresh one\n"
         "/reset - clear the live session immediately\n\n"
         "Workspace\n"
@@ -1261,9 +1261,9 @@ class WhatsAppAgentGateway:
             )
             return True
 
-        if command in {"/search-session", "/search-sessions", "/sessions"}:
+        if command in {"/search-session", "/search-sessions", "/sessions", "/ss"}:
             if not arg:
-                await self.send_message(chat_id, "Usage: /search-session <query>")
+                await self.send_message(chat_id, "Usage: /search-session <query> or /ss <query>")
                 return True
             archive_snapshot(chat_state)
             matches = search_saved_sessions(chat_state, arg, limit=5)

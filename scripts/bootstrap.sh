@@ -88,7 +88,7 @@ check_node() {
 }
 
 restore_tty_stdin() {
-  if [[ ! -t 0 && -r /dev/tty ]]; then
+  if [[ ! -t 0 ]] && : 2>/dev/null </dev/tty; then
     exec < /dev/tty
   fi
 }
