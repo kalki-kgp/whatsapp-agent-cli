@@ -612,6 +612,7 @@ class WhatsAppAgentGateway:
         self.upgrade_notice = ""
         self.last_upgrade_check = 0.0
         self.memory_task: asyncio.Task[Any] | None = None
+        self.upgrade_task: asyncio.Task[Any] | None = None
         self.whisper_model: Any | None = None
         self.whisper_lock = asyncio.Lock()
 
@@ -629,11 +630,19 @@ class WhatsAppAgentGateway:
         self.config.ensure_dirs()
         self.http = aiohttp.ClientSession()
         await self.start_bridge()
+        if self.config.upgrade_check:
+            self.upgrade_task = asyncio.create_task(self.upgrade_notice_loop())
         if self.config.memory_enabled:
             self.memory_task = asyncio.create_task(self.memory_rollover_loop())
         try:
             await self.poll_loop()
         finally:
+            if self.upgrade_task:
+                self.upgrade_task.cancel()
+                try:
+                    await self.upgrade_task
+                except asyncio.CancelledError:
+                    pass
             if self.memory_task:
                 self.memory_task.cancel()
                 try:
@@ -643,6 +652,8 @@ class WhatsAppAgentGateway:
 
     async def shutdown(self) -> None:
         self.stop_event.set()
+        if self.upgrade_task:
+            self.upgrade_task.cancel()
         if self.memory_task:
             self.memory_task.cancel()
         for task in list(self.typing_tasks.values()):
@@ -910,7 +921,7 @@ class WhatsAppAgentGateway:
             f"I will ask the agent to run: {pending['command']}"
         )
 
-    async def refresh_upgrade_notice(self) -> None:
+    async def refresh_upgrade_notice(self, *, force: bool = False) -> None:
         if not self.config.upgrade_check or not self.config.package_version:
             return
         now = time.monotonic()
@@ -919,7 +930,7 @@ class WhatsAppAgentGateway:
             if is_newer_version(self.latest_package_version, self.config.package_version)
             else self.config.upgrade_check_retry_interval
         )
-        if now - self.last_upgrade_check < interval:
+        if not force and now - self.last_upgrade_check < interval:
             return
         self.last_upgrade_check = now
 
@@ -934,7 +945,7 @@ class WhatsAppAgentGateway:
                 payload = await resp.json()
             latest = str((payload.get("info") or {}).get("version") or "").strip()
         except Exception:
-            LOG.debug("Failed to check whatsapp-agent-cli version", exc_info=True)
+            LOG.warning("Failed to check whatsapp-agent-cli version", exc_info=True)
             return
 
         self.latest_package_version = latest
@@ -950,6 +961,53 @@ class WhatsAppAgentGateway:
             )
         else:
             self.upgrade_notice = ""
+
+    async def upgrade_notice_loop(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                await self.refresh_upgrade_notice(force=True)
+                await self.send_proactive_upgrade_notices()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOG.exception("Upgrade notice loop failed")
+
+            delay = (
+                self.config.upgrade_check_interval
+                if is_newer_version(self.latest_package_version, self.config.package_version)
+                else self.config.upgrade_check_retry_interval
+            )
+            try:
+                await asyncio.wait_for(self.stop_event.wait(), timeout=max(5.0, delay))
+            except asyncio.TimeoutError:
+                pass
+
+    async def send_proactive_upgrade_notices(self) -> None:
+        latest = self.latest_package_version
+        current = self.config.package_version
+        if not latest or not is_newer_version(latest, current):
+            return
+
+        chats = self.state.data.get("chats") or {}
+        for chat_id, chat_state in chats.items():
+            if chat_state.get("dismissed_upgrade_version") == latest:
+                continue
+            pending = chat_state.get("pending_upgrade") or {}
+            if pending.get("type") == "upgrade" and pending.get("to_version") == latest:
+                continue
+
+            notice = self.build_upgrade_notice(chat_state)
+            if not notice:
+                continue
+            LOG.info("Sending proactive upgrade notice chat=%s version=%s", chat_id, latest)
+            try:
+                await self.send_message(chat_id, notice)
+            except Exception:
+                current_pending = chat_state.get("pending_upgrade") or {}
+                if current_pending.get("to_version") == latest:
+                    chat_state.pop("pending_upgrade", None)
+                    self.state.save()
+                LOG.exception("Failed to send proactive upgrade notice chat=%s", chat_id)
 
     def memory_dir_for_chat(self, chat_id: str) -> Path:
         return self.config.memory_dir / chat_memory_slug(chat_id)

@@ -205,7 +205,7 @@ WHATSAPP_ALLOWED_USERS=917385166726, 14155551212
 
 The bridge also tolerates suffix-only input and resolves LID↔phone via `bridge/allowlist.js`, but country-code format is the cleanest.
 
-When the gateway sees a newer `whatsapp-agent-cli` release on PyPI, it appends an upgrade approval prompt to replies. Reply `/yes` to let the agent upgrade the persistent `uv tool`, sync the runtime, and restart the systemd user service. Reply `/no` to dismiss that version.
+When the gateway sees a newer `whatsapp-agent-cli` release on PyPI, it proactively sends an upgrade approval prompt to known chats and can also append it to replies. Reply `/yes` to let the agent upgrade the persistent `uv tool`, sync the runtime, and restart the systemd user service. Reply `/no` to dismiss that version.
 
 ## Voice Notes
 

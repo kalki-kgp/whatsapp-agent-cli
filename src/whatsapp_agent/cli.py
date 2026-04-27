@@ -168,6 +168,21 @@ def cmd_run(args: argparse.Namespace) -> int:
         env["AGENT_ENV_FILE"] = str(env_file)
         parsed_env = _parse_env_file(env_file)
 
+    service_name = parsed_env.get("SERVICE_NAME") or DEFAULT_SERVICE_NAME
+    if not args.force and shutil.which("systemctl") is not None:
+        service = f"{service_name}.service"
+        active = subprocess.run(
+            ["systemctl", "--user", "is-active", "--quiet", service],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        ).returncode == 0
+        if active:
+            _fail(f"{service} is already running.")
+            _warn("Use `whatsapp-agent service logs` to watch it, or stop the service before `whatsapp-agent run`.")
+            _warn("To intentionally run a second foreground gateway, use `whatsapp-agent run --force`.")
+            return 1
+
     if args.plain or not sys.stdout.isatty():
         print("  whatsapp-agent gateway running in foreground. Press Ctrl-C to stop.")
         return subprocess.call([str(venv_python), str(gateway)], env=env, cwd=str(install_dir))
@@ -570,6 +585,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_run = sub.add_parser("run", help="Run the gateway with a live terminal monitor.")
     p_run.add_argument("--plain", action="store_true",
                        help="Use the old foreground log mode instead of the terminal monitor.")
+    p_run.add_argument("--force", action="store_true",
+                       help="Run even if the systemd user service is already active.")
     p_run.set_defaults(func=cmd_run)
 
     p_svc = sub.add_parser("service", help="Control the systemd user service.")
