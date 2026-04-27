@@ -508,6 +508,33 @@ def search_saved_sessions(
     return ranked[:limit]
 
 
+def format_chat_help() -> str:
+    return (
+        "whatsapp-agent chat commands\n\n"
+        "Session\n"
+        "/status - show backend, root, model, active session id, memory, and saved count\n"
+        "/title <name> - name the current session; this name appears in /resume\n"
+        "/resume - list the current session plus saved sessions\n"
+        "/resume <name-or-id> - switch back to a saved session\n"
+        "/search-session <query> - find and resume the best matching saved session\n"
+        "/new - archive the current session and start a fresh one\n"
+        "/reset - clear the live session immediately\n\n"
+        "Workspace\n"
+        "/root /absolute/path - change the repo or working directory for this chat\n"
+        "/model <name> - change the model for future turns without clearing this session\n"
+        "/model - show the current model\n\n"
+        "Memory\n"
+        "/compact - write a carry-forward summary while keeping the same session id\n"
+        "/memory - show this chat's memory files and rollover state\n"
+        "/memory update - update memory files and compact this session now\n\n"
+        "Approvals\n"
+        "/yes - approve a pending gateway action, like an upgrade\n"
+        "/no - dismiss a pending gateway action\n\n"
+        "Normal messages go straight to the agent. Each WhatsApp chat keeps its own root, "
+        "model, session id, title, and memory."
+    )
+
+
 class WhatsAppAgentGateway:
     def __init__(self, config: Config) -> None:
         self.config = config
@@ -1085,13 +1112,12 @@ class WhatsAppAgentGateway:
                 current = chat_state.get("model") or self.config.model or "(default)"
                 await self.send_message(chat_id, f"Current model: {current}")
                 return True
-            archive_snapshot(chat_state)
             chat_state["model"] = arg
-            clear_active_session(chat_state, keep_summary=True)
+            archive_snapshot(chat_state)
             self.state.save()
             await self.send_message(
                 chat_id,
-                f"Model set to {arg}. I kept the compacted summary if there was one and cleared the live thread.",
+                f"Model set to {arg}. The active session id and context are unchanged.",
             )
             return True
 
@@ -1212,22 +1238,7 @@ class WhatsAppAgentGateway:
             return True
 
         if command == "/help":
-            await self.send_message(
-                chat_id,
-                "/status shows current chat state.\n"
-                "/new or /clear starts fresh and archives the current session.\n"
-                "/resume lists saved sessions or resumes one by name.\n"
-                "/title <name> names the current session.\n"
-                "/root /path switches the project root for this chat.\n"
-                "/model <name> switches the model for this chat.\n"
-                "/compact writes a carry-forward summary while keeping this session.\n"
-                "/memory shows the long-term memory index path.\n"
-                "/memory update saves memory and compacts this session now.\n"
-                "/search-session <query> finds and resumes the best matching saved session.\n"
-                "/yes approves a pending gateway action like an upgrade.\n"
-                "/no dismisses a pending gateway action.\n"
-                "/reset clears the live thread immediately.",
-            )
+            await self.send_message(chat_id, format_chat_help())
             return True
 
         return False

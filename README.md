@@ -156,13 +156,13 @@ Send these as WhatsApp messages from any allowed number:
 | `/search-session <query>` | Find and resume the most relevant saved session |
 | `/title <name>` | Name the current session; this is the session name shown by `/resume` |
 | `/root /abs/path` | Change the working directory for this chat |
-| `/model <name>` | Change the model for this chat |
+| `/model <name>` | Change the model for future turns without clearing the session |
 | `/compact` | Write a carry-forward summary while keeping the same session id |
 | `/memory` | Show this chat's long-term memory index and session ids |
 | `/memory update` | Update memory files and compact the active session in place |
 | `/yes` | Approve a pending gateway action, such as a package upgrade |
 | `/no` | Dismiss a pending gateway action |
-| `/help` | Show the command list |
+| `/help` | Show all chat commands and quick usage notes |
 
 ## Configuration
 
