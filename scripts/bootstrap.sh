@@ -2,7 +2,8 @@
 set -euo pipefail
 
 # One-command installer for users on PEP 668 systems where system pip is blocked.
-# It installs uv into the user's account when needed, then runs the PyPI CLI.
+# It installs uv into the user's account when needed, installs the PyPI CLI
+# persistently as a uv tool, then runs it.
 
 PACKAGE="${WHATSAPP_AGENT_PACKAGE:-whatsapp-agent-cli}"
 VERSION="${WHATSAPP_AGENT_CLI_VERSION:-}"
@@ -92,15 +93,30 @@ restore_tty_stdin() {
   fi
 }
 
+install_cli_tool() {
+  note "Installing $PACKAGE_SPEC as a user CLI tool."
+  uv tool install --upgrade "$PACKAGE_SPEC"
+  add_user_bins_to_path
+
+  if ! command -v "$COMMAND" >/dev/null 2>&1; then
+    fail "$COMMAND was installed, but it is not on PATH yet."
+    note "Run: export PATH=\"\$HOME/.local/bin:\$PATH\""
+    note "Then retry: $COMMAND $*"
+    exit 1
+  fi
+  ok "$COMMAND installed: $(command -v "$COMMAND")"
+}
+
 main() {
   add_user_bins_to_path
   printf '\n  whatsapp-agent bootstrap\n\n'
   install_uv
   check_node
+  install_cli_tool "$@"
   restore_tty_stdin
   printf '\n'
-  note "Running: uvx --from $PACKAGE_SPEC $COMMAND $*"
-  exec uvx --from "$PACKAGE_SPEC" "$COMMAND" "$@"
+  note "Running: $COMMAND $*"
+  exec "$COMMAND" "$@"
 }
 
 main "$@"

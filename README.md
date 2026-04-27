@@ -40,12 +40,13 @@ The fastest path — one command, zero clones, no system `pip`:
 curl -fsSL https://raw.githubusercontent.com/kalki-kgp/whatsapp-agent-cli/main/scripts/bootstrap.sh | bash
 ```
 
-This works on newer Debian/Ubuntu releases where `pip install ...` is blocked by PEP 668. The bootstrap installs `uv` into your user account if needed, checks Node/npm, then runs the real installer from PyPI.
+This works on newer Debian/Ubuntu releases where `pip install ...` is blocked by PEP 668. The bootstrap installs `uv` into your user account if needed, checks Node/npm, installs the `whatsapp-agent` CLI persistently, then runs the real installer from PyPI.
 
 If you already have `uv`, this is the same as:
 
 ```bash
-uvx whatsapp-agent-cli install
+uv tool install --upgrade whatsapp-agent-cli
+whatsapp-agent install
 ```
 
 Or install the CLI persistently:
