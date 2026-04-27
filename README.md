@@ -20,7 +20,7 @@ You (WhatsApp)  ──▶  Baileys bridge  ──▶  gateway  ──▶  codex 
 ## Why
 
 - **One number per server.** Your phone becomes the control surface. No web UIs, no port forwarding, no VPNs.
-- **Per-chat memory.** Each WhatsApp chat keeps its own working directory, model, session, and summary — so chat A can stay on one repo while chat B works somewhere else.
+- **Per-chat memory.** Each WhatsApp chat keeps its own working directory, model, session, daily memory files, and saved session ids — so chat A can stay on one repo while chat B works somewhere else.
 - **Real CLI access.** It's not a wrapper API — it shells out to the actual `codex` / `claude` binary on the host with full tool use, file edits, etc.
 - **Self-hosted, local-only.** Everything (bridge, gateway, state) runs on your box. No third-party message broker.
 
@@ -110,10 +110,13 @@ whatsapp-agent service status
 whatsapp-agent service logs         # journalctl -f
 whatsapp-agent doctor               # diagnose the install
 whatsapp-agent path                 # print the install dir
+whatsapp-agent uninstall            # stop service and remove install dir/state
 whatsapp-agent --version
 ```
 
 `--install-dir <path>` works on every subcommand if you want to manage multiple installs side-by-side.
+
+`whatsapp-agent uninstall --yes` removes the systemd user service plus the full install directory, including `.env`, `.venv`, `node_modules`, WhatsApp pairing data, logs, and state. Use it before a clean reinstall if a previous runtime directory is wedged.
 
 ## Chat commands
 
@@ -130,6 +133,10 @@ Send these as WhatsApp messages from any allowed number:
 | `/root /abs/path` | Change the working directory for this chat |
 | `/model <name>` | Change the model for this chat |
 | `/compact` | Roll the conversation into a carry-forward summary |
+| `/memory` | Show this chat's long-term memory index and session ids |
+| `/memory update` | Update memory files, archive the active session, and preload the next session summary |
+| `/yes` | Approve a pending gateway action, such as a package upgrade |
+| `/no` | Dismiss a pending gateway action |
 | `/help` | Show the command list |
 
 ## Configuration
@@ -146,6 +153,13 @@ Settings live in `~/.agent-whatsapp/.env`. Edit by hand or re-run `whatsapp-agen
 | `WHATSAPP_ALLOWED_USERS` | Comma-separated phone numbers / LIDs allowed to message the bridge |
 | `WHATSAPP_PORT` | Local bridge HTTP port (default `3010`) |
 | `CW_LOG_LEVEL` | Python log level (default `INFO`) |
+| `AGENT_MEMORY_ENABLED` | Set to `0` to disable long-term memory and daily rollovers |
+| `AGENT_MEMORY_DIR` | Memory root; each chat gets a folder containing `MEMORY.md` |
+| `AGENT_MEMORY_ROLLOVER_TIME` | Daily local time, `HH:MM`, to update memory and roll sessions forward |
+| `AGENT_MEMORY_FILES` | Comma-separated core memory files; default includes `user.md`, `career.md`, `projects.md`, `preferences.md`, `open-loops.md` |
+| `AGENT_UPGRADE_CHECK` | Set to `0` to disable PyPI upgrade notices |
+| `AGENT_PACKAGE_VERSION` | Installed package version used for upgrade notices |
+| `SERVICE_NAME` | systemd user service name used by approved upgrades |
 
 For `WHATSAPP_ALLOWED_USERS`, full international format is the safest:
 
@@ -154,6 +168,27 @@ WHATSAPP_ALLOWED_USERS=917385166726, 14155551212
 ```
 
 The bridge also tolerates suffix-only input and resolves LID↔phone via `bridge/allowlist.js`, but country-code format is the cleanest.
+
+When the gateway sees a newer `whatsapp-agent-cli` release on PyPI, it appends an upgrade approval prompt to replies. Reply `/yes` to let the agent run the upgrade command in that same chat, or `/no` to dismiss that version.
+
+## Long-Term Memory
+
+Memory is enabled by default. At `AGENT_MEMORY_ROLLOVER_TIME` each day, the gateway finds active chats whose current session started before that time, asks the live agent session to update long-term memory files and write a carry-forward summary, archives the current session id, and starts the next session with that summary preloaded.
+
+Each chat gets its own folder under `AGENT_MEMORY_DIR`:
+
+```text
+memory/<chat-id-hash>/
+  MEMORY.md
+  user.md
+  career.md
+  projects.md
+  preferences.md
+  open-loops.md
+  sessions/
+```
+
+`MEMORY.md` is the index. Topic files hold the details, and `sessions/` stores daily rollover records with the archived session id. Send `/memory` to see the paths and active/previous session ids, or `/memory update` to force the rollover and summary handoff immediately.
 
 ## Troubleshooting
 
@@ -194,6 +229,7 @@ Two processes, one wrapper CLI on top.
 │                                                                │
 │   .venv/             (python deps for the gateway)             │
 │   bridge/node_modules/                                         │
+│   memory/            (per-chat MEMORY.md + topic files)        │
 │   .env               (config, mode 600)                        │
 │   state.json         (per-chat session metadata)               │
 └────────────────────────────────────────────────────────────────┘
@@ -201,7 +237,7 @@ Two processes, one wrapper CLI on top.
 
 `whatsapp-agent install` populates this layout from a wheel-bundled copy of `bridge/`, `server/`, `scripts/`, and `systemd/`, then runs `npm install` and `uv pip install`. Subsequent `whatsapp-agent install --reconfigure` rewrites only `.env`, leaving the venv / node_modules / WhatsApp session intact.
 
-Per-chat session state stores: `thread_id`, `root`, `model`, `summary`, and up to 30 `saved_sessions`.
+Per-chat session state stores: `thread_id`, `root`, `model`, `summary`, memory rollover metadata, and up to 30 `saved_sessions`.
 
 ## Repository layout
 

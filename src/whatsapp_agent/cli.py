@@ -7,7 +7,7 @@ import os
 import shutil
 import subprocess
 import sys
-from importlib.resources import as_file, files
+from importlib.resources import files
 from pathlib import Path
 from typing import Iterable
 
@@ -17,7 +17,7 @@ DEFAULT_INSTALL_DIR = Path(os.environ.get("AGENT_WHATSAPP_HOME", str(Path.home()
 DEFAULT_SERVICE_NAME = os.environ.get("SERVICE_NAME", "agent-whatsapp")
 
 # Files / dirs at the destination that must NEVER be overwritten by sync.
-PRESERVE = {".env", ".venv", "node_modules", "whatsapp", "state.json", "logs"}
+PRESERVE = {".env", ".venv", "node_modules", "whatsapp", "state.json", "logs", "memory"}
 
 GREEN = "\033[38;2;37;211;102m"
 RED = "\033[31m"
@@ -109,6 +109,7 @@ def cmd_install(args: argparse.Namespace) -> int:
         "INSTALL_DIR": str(install_dir),
         "SERVICE_NAME": args.service or DEFAULT_SERVICE_NAME,
         "SKIP_CLONE": "1",
+        "AGENT_PACKAGE_VERSION": __version__,
     }
     return _exec_bash(script, forwarded, env=env)
 
@@ -163,6 +164,70 @@ def cmd_service(args: argparse.Namespace) -> int:
         cmd = ["systemctl", "--user", verb, service, *flags]
 
     return subprocess.call(cmd)
+
+
+def _run_quiet(cmd: list[str]) -> bool:
+    return subprocess.run(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    ).returncode == 0
+
+
+def _dangerous_delete_target(path: Path) -> bool:
+    resolved = path.expanduser().resolve()
+    protected = {
+        Path("/").resolve(),
+        Path.home().resolve(),
+        Path.home().parent.resolve(),
+    }
+    return resolved in protected
+
+
+def cmd_uninstall(args: argparse.Namespace) -> int:
+    install_dir = Path(args.install_dir or DEFAULT_INSTALL_DIR).expanduser()
+    service = f"{args.service or DEFAULT_SERVICE_NAME}.service"
+
+    if _dangerous_delete_target(install_dir):
+        _fail(f"Refusing to remove unsafe install dir: {install_dir}")
+        return 1
+
+    if not args.yes:
+        if not sys.stdin.isatty():
+            _fail("Refusing to uninstall without --yes in a non-interactive shell.")
+            return 1
+        print(f"\n  {BOLD}Uninstall whatsapp-agent{RESET}")
+        print(f"  Service:     {service}")
+        print(f"  Install dir: {install_dir}")
+        answer = input("\n  Remove the service and delete this install dir? [y/N] ").strip().lower()
+        if answer not in {"y", "yes"}:
+            _warn("uninstall cancelled.")
+            return 1
+
+    if shutil.which("systemctl") is not None:
+        _run_quiet(["systemctl", "--user", "stop", service])
+        _run_quiet(["systemctl", "--user", "disable", service])
+        unit_path = Path.home() / ".config" / "systemd" / "user" / service
+        if unit_path.exists() or unit_path.is_symlink():
+            unit_path.unlink()
+            _ok(f"removed service unit {unit_path}")
+        _run_quiet(["systemctl", "--user", "daemon-reload"])
+        _run_quiet(["systemctl", "--user", "reset-failed", service])
+    else:
+        _warn("systemctl not found — skipped service cleanup.")
+
+    if install_dir.exists() or install_dir.is_symlink():
+        if install_dir.is_symlink() or install_dir.is_file():
+            install_dir.unlink()
+        else:
+            shutil.rmtree(install_dir)
+        _ok(f"removed install dir {install_dir}")
+    else:
+        _warn(f"install dir not found: {install_dir}")
+
+    _ok("uninstall complete")
+    return 0
 
 
 def _parse_env_file(path: Path) -> dict[str, str]:
@@ -275,6 +340,12 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Action to perform.")
     p_svc.add_argument("--service", default=None, help="systemd user service name.")
     p_svc.set_defaults(func=cmd_service)
+
+    p_uninstall = sub.add_parser("uninstall", help="Remove the service and install dir.")
+    p_uninstall.add_argument("--service", default=None, help="systemd user service name.")
+    p_uninstall.add_argument("-y", "--yes", action="store_true",
+                             help="Do not prompt before deleting the install dir.")
+    p_uninstall.set_defaults(func=cmd_uninstall)
 
     p_doc = sub.add_parser("doctor", help="Run diagnostics on the install.")
     p_doc.set_defaults(func=cmd_doctor)

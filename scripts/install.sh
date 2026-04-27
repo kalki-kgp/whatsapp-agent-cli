@@ -52,6 +52,11 @@ Env vars consumed in --non-interactive mode (or as defaults):
   AGENT_BACKEND          codex | claude
   AGENT_COMMAND          path to the CLI binary
   AGENT_MODEL            model name (blank = CLI default)
+  AGENT_MEMORY_DIR       memory root (default INSTALL_DIR/memory)
+  AGENT_MEMORY_ENABLED   1/0 toggle for long-term memory
+  AGENT_MEMORY_ROLLOVER_TIME
+                         daily local rollover time, HH:MM (default 04:00)
+  AGENT_PACKAGE_VERSION  installed whatsapp-agent-cli version
   AGENT_ROOT             default working directory
   WHATSAPP_MODE          bot | self-chat
   WHATSAPP_ALLOWED_USERS comma-separated phone numbers (E.164 digits)
@@ -237,6 +242,15 @@ validate_port() {
   return 0
 }
 
+validate_time_hhmm() {
+  local v="${1:-}"
+  if [[ ! "$v" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]]; then
+    VALIDATION_ERR="Use 24-hour HH:MM format, e.g. 04:00 or 23:30."
+    return 1
+  fi
+  return 0
+}
+
 validate_path() {
   local v="${1:-}"
   if [[ -z "$v" ]]; then
@@ -296,6 +310,16 @@ detect_cli_path() {
   return 1
 }
 
+detect_package_version() {
+  if [[ -n "${AGENT_PACKAGE_VERSION:-}" ]]; then
+    printf '%s\n' "$AGENT_PACKAGE_VERSION"
+    return 0
+  fi
+  if [[ -f "$INSTALL_DIR/pyproject.toml" ]]; then
+    sed -n 's/^version = "\(.*\)"/\1/p' "$INSTALL_DIR/pyproject.toml" | head -n 1
+  fi
+}
+
 load_existing_env() {
   [[ -f "$INSTALL_DIR/.env" ]] || return 0
   local k v
@@ -337,8 +361,10 @@ run_step() {
     sleep 0.08
     i=$((i + 1))
   done
+  set +e
   wait "$pid"
   local rc=$?
+  set -e
   printf '\r\033[2K'
   printf '%s' "$SHOW_CURSOR"
   if [[ $rc -eq 0 ]]; then
@@ -379,7 +405,7 @@ clone_or_update_repo() {
 
 install_python_deps() {
   export PATH="$HOME/.local/bin:$PATH"
-  uv venv "$INSTALL_DIR/.venv" --python "$PYTHON_BIN"
+  uv venv --clear "$INSTALL_DIR/.venv" --python "$PYTHON_BIN"
   uv pip install --python "$INSTALL_DIR/.venv/bin/python" \
     -r "$INSTALL_DIR/requirements.txt"
 }
@@ -391,9 +417,14 @@ install_node_deps() {
 write_env_file() {
   cat > "$INSTALL_DIR/.env" <<EOF
 AGENT_WHATSAPP_HOME=$INSTALL_DIR
+SERVICE_NAME=$SERVICE_NAME
 AGENT_BACKEND=$BACKEND
 AGENT_COMMAND=$AGENT_COMMAND
 AGENT_MODEL=$MODEL
+AGENT_MEMORY_DIR=$MEMORY_DIR
+AGENT_MEMORY_ENABLED=$MEMORY_ENABLED
+AGENT_MEMORY_ROLLOVER_TIME=$MEMORY_ROLLOVER_TIME
+AGENT_PACKAGE_VERSION=$PACKAGE_VERSION
 AGENT_ROOT=$ROOT
 WHATSAPP_MODE=$MODE
 WHATSAPP_ALLOWED_USERS=$ALLOWED_USERS
@@ -426,11 +457,13 @@ advanced_menu() {
       "Bridge port         ${DIM}·${RESET} $PORT"
       "Model               ${DIM}·${RESET} $model_show"
       "CLI command         ${DIM}·${RESET} $AGENT_COMMAND"
+      "Memory dir          ${DIM}·${RESET} $MEMORY_DIR"
+      "Memory rollover     ${DIM}·${RESET} $MEMORY_ROLLOVER_TIME"
       "Done"
     )
     menu_select "Advanced settings" \
       "Pick a value to override; choose Done when finished." \
-      5 "${labels[@]}"
+      7 "${labels[@]}"
     case "$MENU_INDEX" in
       0) prompt_text "Working root" \
            "Default working directory for new chats." \
@@ -444,7 +477,13 @@ advanced_menu() {
       3) prompt_text "CLI command" \
            "Path to the codex / claude binary." \
            "$AGENT_COMMAND" validate_path && AGENT_COMMAND="$PROMPT_RESULT" ;;
-      4) return ;;
+      4) prompt_text "Memory dir" \
+           "Long-term memory root. Each WhatsApp chat gets its own folder." \
+           "$MEMORY_DIR" validate_path && MEMORY_DIR="$PROMPT_RESULT" ;;
+      5) prompt_text "Memory rollover time" \
+           "Daily local time to update memories and preload the next session summary." \
+           "$MEMORY_ROLLOVER_TIME" validate_time_hhmm && MEMORY_ROLLOVER_TIME="$PROMPT_RESULT" ;;
+      6) return ;;
     esac
   done
 }
@@ -463,6 +502,8 @@ print_summary() {
   printf '  %s│%s  %-16s %s\n' "$GREEN" "$RESET" "Working root"  "$ROOT"
   printf '  %s│%s  %-16s %b\n' "$GREEN" "$RESET" "Bridge port"   "$port_show"
   printf '  %s│%s  %-16s %s\n' "$GREEN" "$RESET" "Model"         "$model_show"
+  printf '  %s│%s  %-16s %s\n' "$GREEN" "$RESET" "Memory dir"    "$MEMORY_DIR"
+  printf '  %s│%s  %-16s %s\n' "$GREEN" "$RESET" "Memory time"   "$MEMORY_ROLLOVER_TIME"
   printf '  %s│%s  %-16s %s\n' "$GREEN" "$RESET" "Install dir"   "$INSTALL_DIR"
   printf '  %s└──────────────────────────────────────────────%s\n' "$GREEN" "$RESET"
 }
@@ -545,6 +586,10 @@ main() {
   # ── defaults for the rest ─────────────────────────────────────────────────
   ROOT="${AGENT_ROOT:-$HOME}"
   MODEL="${AGENT_MODEL:-}"
+  MEMORY_DIR="${AGENT_MEMORY_DIR:-$INSTALL_DIR/memory}"
+  MEMORY_ENABLED="${AGENT_MEMORY_ENABLED:-1}"
+  MEMORY_ROLLOVER_TIME="${AGENT_MEMORY_ROLLOVER_TIME:-04:00}"
+  PACKAGE_VERSION="${AGENT_PACKAGE_VERSION:-}"
 
   PORT_AUTO=0
   if [[ -n "${WHATSAPP_PORT:-}" ]]; then
@@ -594,6 +639,9 @@ main() {
   run_step "ensuring uv is available"        ensure_uv
   run_step "creating python venv + deps"     install_python_deps
   run_step "installing node bridge deps"     install_node_deps
+  if [[ -z "$PACKAGE_VERSION" ]]; then
+    PACKAGE_VERSION="$(detect_package_version || true)"
+  fi
   run_step "writing $INSTALL_DIR/.env"       write_env_file
   run_step "installing systemd user service" install_systemd_unit
 
@@ -669,7 +717,7 @@ print_finished() {
 
   printf '  %sIn-chat commands%s  %s(send via WhatsApp)%s\n' "$BOLD" "$RESET" "$DIM" "$RESET"
   printf '    /status   /new   /reset   /resume   /title <name>\n'
-  printf '    /root /abs/path   /model <name>   /compact   /help\n\n'
+  printf '    /root /abs/path   /model <name>   /compact   /memory   /help\n\n'
 }
 
 main "$@"

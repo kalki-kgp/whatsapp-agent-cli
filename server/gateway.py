@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 import asyncio
+import hashlib
 import json
 import logging
 import os
+import re
 import shlex
 import signal
 import tempfile
+import time
 from collections import deque
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time as datetime_time
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -16,6 +19,8 @@ import aiohttp
 
 
 LOG = logging.getLogger("codex_whatsapp")
+PYPI_PROJECT_URL = "https://pypi.org/pypi/whatsapp-agent-cli/json"
+DEFAULT_MEMORY_FILES = ["user.md", "career.md", "projects.md", "preferences.md", "open-loops.md"]
 
 
 def load_env_file(path: Path) -> None:
@@ -42,6 +47,65 @@ def _env_first(*names: str, default: str = "") -> str:
         if value is not None and value.strip():
             return value.strip()
     return default
+
+
+def _env_list(name: str, default: list[str]) -> list[str]:
+    raw = os.getenv(name, "")
+    if not raw.strip():
+        return list(default)
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def _version_numbers(value: str) -> list[int]:
+    head = (value or "").strip().lower().split("+", 1)[0].split("-", 1)[0]
+    numbers: list[int] = []
+    for part in head.replace("_", ".").split("."):
+        digits = ""
+        for char in part:
+            if not char.isdigit():
+                break
+            digits += char
+        if digits:
+            numbers.append(int(digits))
+    return numbers
+
+
+def is_newer_version(latest: str, current: str) -> bool:
+    latest_parts = _version_numbers(latest)
+    current_parts = _version_numbers(current)
+    if not latest_parts or not current_parts:
+        return False
+    width = max(len(latest_parts), len(current_parts))
+    latest_parts.extend([0] * (width - len(latest_parts)))
+    current_parts.extend([0] * (width - len(current_parts)))
+    return latest_parts > current_parts
+
+
+def parse_daily_time(value: str) -> datetime_time:
+    raw = (value or "04:00").strip()
+    try:
+        hour_text, minute_text = raw.split(":", 1)
+        hour = int(hour_text)
+        minute = int(minute_text)
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            return datetime_time(hour=hour, minute=minute)
+    except Exception:
+        pass
+    LOG.warning("Invalid AGENT_MEMORY_ROLLOVER_TIME=%r, using 04:00", value)
+    return datetime_time(hour=4, minute=0)
+
+
+def build_upgrade_prompt(current: str, latest: str, command: str) -> str:
+    return (
+        "The WhatsApp operator approved upgrading this whatsapp-agent-cli runtime.\n"
+        f"Current installed version: {current or '(unknown)'}\n"
+        f"Latest available version: {latest}\n"
+        "\n"
+        "Run the upgrade command below, verify the result, and keep the reply concise.\n"
+        "If restarting the service interrupts this chat response, that is acceptable.\n"
+        "\n"
+        f"Command:\n{command}\n"
+    )
 
 
 class Config:
@@ -80,9 +144,24 @@ class Config:
         self.bridge_log = self.logs_dir / "bridge.log"
         self.processed_limit = int(os.getenv("CW_PROCESSED_LIMIT", "2000"))
         self.typing_interval = float(os.getenv("CW_TYPING_INTERVAL", "8"))
+        self.package_version = _env_first("AGENT_PACKAGE_VERSION", default="")
+        self.upgrade_check = _env_flag("AGENT_UPGRADE_CHECK", default=True)
+        self.upgrade_check_interval = float(os.getenv("AGENT_UPGRADE_CHECK_INTERVAL", "3600"))
+        self.service_name = _env_first("SERVICE_NAME", default="agent-whatsapp")
+        self.memory_enabled = _env_flag("AGENT_MEMORY_ENABLED", default=True)
+        self.memory_dir = Path(
+            _env_first("AGENT_MEMORY_DIR", default=str(self.home / "memory"))
+        ).expanduser()
+        self.memory_rollover_time_text = _env_first("AGENT_MEMORY_ROLLOVER_TIME", default="04:00")
+        self.memory_rollover_time = parse_daily_time(self.memory_rollover_time_text)
+        self.memory_check_interval = float(os.getenv("AGENT_MEMORY_CHECK_INTERVAL", "60"))
+        self.memory_files = _env_list("AGENT_MEMORY_FILES", DEFAULT_MEMORY_FILES)
 
     def ensure_dirs(self) -> None:
-        for path in [self.home, self.logs_dir, self.session_dir.parent]:
+        paths = [self.home, self.logs_dir, self.session_dir.parent]
+        if self.memory_enabled:
+            paths.append(self.memory_dir)
+        for path in paths:
             path.mkdir(parents=True, exist_ok=True)
         self.default_root.mkdir(parents=True, exist_ok=True)
 
@@ -183,8 +262,100 @@ def now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def local_now() -> datetime:
+    return datetime.now().astimezone()
+
+
 def default_session_name() -> str:
-    return datetime.now().astimezone().strftime("Session %Y-%m-%d %H:%M")
+    return local_now().strftime("Session %Y-%m-%d %H:%M")
+
+
+def chat_memory_slug(chat_id: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "-", chat_id).strip("-")[:48]
+    digest = hashlib.sha1(chat_id.encode("utf-8")).hexdigest()[:10]
+    if cleaned:
+        return f"{cleaned}-{digest}"
+    return digest
+
+
+def memory_file_description(filename: str) -> str:
+    descriptions = {
+        "user.md": "stable details about the WhatsApp operator",
+        "career.md": "career history, goals, preferences, and constraints",
+        "projects.md": "active projects, repos, decisions, and status",
+        "preferences.md": "communication, coding, tooling, and workflow preferences",
+        "open-loops.md": "unresolved tasks, follow-ups, and promises",
+    }
+    return descriptions.get(filename, "topic-specific long-term memory")
+
+
+def markdown_title(filename: str) -> str:
+    stem = Path(filename).stem.replace("-", " ").replace("_", " ").strip()
+    return stem.title() if stem else "Memory"
+
+
+def ensure_memory_scaffold(memory_dir: Path, memory_files: list[str]) -> Path:
+    memory_dir.mkdir(parents=True, exist_ok=True)
+    (memory_dir / "sessions").mkdir(parents=True, exist_ok=True)
+
+    for filename in memory_files:
+        path = memory_dir / filename
+        if not path.exists():
+            path.write_text(f"# {markdown_title(filename)}\n\n", encoding="utf-8")
+
+    index_path = memory_dir / "MEMORY.md"
+    if index_path.exists():
+        content = index_path.read_text(encoding="utf-8", errors="replace")
+    else:
+        content = (
+            "# Memory Index\n\n"
+            "Long-term memory for this WhatsApp chat. Keep this file as the map; "
+            "put details in topic files.\n\n"
+            "## Core Memory Files\n\n"
+        )
+
+    changed = False
+    if "## Core Memory Files" not in content:
+        content = content.rstrip() + "\n\n## Core Memory Files\n\n"
+        changed = True
+    for filename in memory_files:
+        marker = f"]({filename})"
+        if marker not in content:
+            content = (
+                content.rstrip()
+                + f"\n- [{filename}]({filename}) - {memory_file_description(filename)}\n"
+            )
+            changed = True
+    if "## Session History" not in content:
+        content = content.rstrip() + "\n\n## Session History\n\n"
+        changed = True
+    if changed or not index_path.exists():
+        index_path.write_text(content.rstrip() + "\n", encoding="utf-8")
+    return index_path
+
+
+def read_memory_index(index_path: Path, limit: int = 6000) -> str:
+    try:
+        text = index_path.read_text(encoding="utf-8", errors="replace").strip()
+    except Exception:
+        return ""
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "\n\n[Memory index truncated.]"
+
+
+def build_carry_forward_summary(update_reply: str, session_id: str, session_file: Path) -> str:
+    summary = update_reply.strip() or "Memory rollover completed."
+    return (
+        "Carry-forward context from the previous WhatsApp agent session.\n"
+        f"Previous session id: {session_id or '(none)'}\n"
+        f"Previous session memory record: {session_file}\n"
+        "\n"
+        "Use this as the starting context for the new session. Read the memory index "
+        "or previous session only when more detail is needed.\n"
+        "\n"
+        f"{summary}"
+    )
 
 
 def archive_snapshot(chat_state: dict[str, Any], *, force: bool = False) -> bool:
@@ -204,6 +375,7 @@ def archive_snapshot(chat_state: dict[str, Any], *, force: bool = False) -> bool
         "model": model,
         "summary": summary,
         "saved_at": now_iso(),
+        "session_started_at": chat_state.get("session_started_at") or "",
     }
 
     updated = False
@@ -223,6 +395,7 @@ def archive_snapshot(chat_state: dict[str, Any], *, force: bool = False) -> bool
 def clear_active_session(chat_state: dict[str, Any], *, keep_summary: bool = False) -> None:
     chat_state.pop("thread_id", None)
     chat_state.pop("title", None)
+    chat_state.pop("session_started_at", None)
     if not keep_summary:
         chat_state.pop("summary", None)
 
@@ -234,11 +407,12 @@ def format_saved_sessions(chat_state: dict[str, Any]) -> str:
     lines = ["Saved sessions:"]
     for entry in saved[:10]:
         name = entry.get("name") or "(untitled)"
+        thread_id = entry.get("thread_id") or "(no id)"
         model = entry.get("model") or "(default)"
         root = entry.get("root") or "(root unset)"
         saved_at = entry.get("saved_at", "")[:16].replace("T", " ")
-        lines.append(f"- {name} | model={model} | root={root} | {saved_at}")
-    lines.append("Use `/resume <name>` to switch back.")
+        lines.append(f"- {name} | id={thread_id} | model={model} | root={root} | {saved_at}")
+    lines.append("Use `/resume <name>` or `/resume <id>` to switch back.")
     return "\n".join(lines)
 
 
@@ -271,15 +445,40 @@ class WhatsAppAgentGateway:
         self.typing_tasks: dict[str, asyncio.Task[Any]] = {}
         self.runtime_seen: deque[str] = deque(maxlen=config.processed_limit)
         self.runtime_seen_set: set[str] = set()
+        self.latest_package_version = ""
+        self.upgrade_notice = ""
+        self.last_upgrade_check = 0.0
+        self.memory_task: asyncio.Task[Any] | None = None
+
+    def upgrade_command(self) -> str:
+        install_dir = shlex.quote(str(self.config.home))
+        service = shlex.quote(f"{self.config.service_name}.service")
+        return (
+            "uvx --upgrade --from whatsapp-agent-cli whatsapp-agent "
+            f"--install-dir {install_dir} install --reconfigure && "
+            f"systemctl --user restart {service}"
+        )
 
     async def run(self) -> None:
         self.config.ensure_dirs()
         self.http = aiohttp.ClientSession()
         await self.start_bridge()
-        await self.poll_loop()
+        if self.config.memory_enabled:
+            self.memory_task = asyncio.create_task(self.memory_rollover_loop())
+        try:
+            await self.poll_loop()
+        finally:
+            if self.memory_task:
+                self.memory_task.cancel()
+                try:
+                    await self.memory_task
+                except asyncio.CancelledError:
+                    pass
 
     async def shutdown(self) -> None:
         self.stop_event.set()
+        if self.memory_task:
+            self.memory_task.cancel()
         for task in list(self.typing_tasks.values()):
             task.cancel()
         if self.http and not self.http.closed:
@@ -406,16 +605,327 @@ class WhatsAppAgentGateway:
 
         if thread_id and chat_state.get("thread_id") != thread_id:
             chat_state["thread_id"] = thread_id
+            chat_state.setdefault("session_started_at", now_iso())
+            self.state.save()
+        elif thread_id and not chat_state.get("session_started_at"):
+            chat_state["session_started_at"] = now_iso()
             self.state.save()
 
+        reply = await self.add_upgrade_notice(reply, chat_state)
         for chunk in split_message(reply, self.config.max_reply_chars):
             await self.send_message(chat_id, chunk)
+
+    async def add_upgrade_notice(self, reply: str, chat_state: dict[str, Any]) -> str:
+        await self.refresh_upgrade_notice()
+        notice = self.build_upgrade_notice(chat_state)
+        if not notice:
+            return reply
+        self.state.save()
+        return f"{reply.rstrip()}\n\n{notice}"
+
+    def build_upgrade_notice(self, chat_state: dict[str, Any]) -> str:
+        latest = self.latest_package_version
+        current = self.config.package_version
+        if not latest or not is_newer_version(latest, current):
+            chat_state.pop("pending_upgrade", None)
+            return ""
+        if chat_state.get("dismissed_upgrade_version") == latest:
+            chat_state.pop("pending_upgrade", None)
+            return ""
+
+        pending = {
+            "type": "upgrade",
+            "from_version": current,
+            "to_version": latest,
+            "command": self.upgrade_command(),
+            "created_at": now_iso(),
+        }
+        chat_state["pending_upgrade"] = pending
+        return (
+            f"Upgrade available: whatsapp-agent-cli {current} -> {latest}.\n"
+            "Reply /yes to approve the upgrade, or /no to dismiss this version.\n"
+            f"I will ask the agent to run: {pending['command']}"
+        )
+
+    async def refresh_upgrade_notice(self) -> None:
+        if not self.config.upgrade_check or not self.config.package_version:
+            return
+        now = time.monotonic()
+        if now - self.last_upgrade_check < self.config.upgrade_check_interval:
+            return
+        self.last_upgrade_check = now
+
+        assert self.http is not None
+        try:
+            async with self.http.get(
+                PYPI_PROJECT_URL,
+                timeout=aiohttp.ClientTimeout(total=5),
+            ) as resp:
+                if resp.status != 200:
+                    return
+                payload = await resp.json()
+            latest = str((payload.get("info") or {}).get("version") or "").strip()
+        except Exception:
+            LOG.debug("Failed to check whatsapp-agent-cli version", exc_info=True)
+            return
+
+        self.latest_package_version = latest
+        if is_newer_version(latest, self.config.package_version):
+            self.upgrade_notice = (
+                f"Upgrade available: whatsapp-agent-cli {self.config.package_version} -> {latest}.\n"
+                "Reply /yes to approve the upgrade, or /no to dismiss this version."
+            )
+        else:
+            self.upgrade_notice = ""
+
+    def memory_dir_for_chat(self, chat_id: str) -> Path:
+        return self.config.memory_dir / chat_memory_slug(chat_id)
+
+    def ensure_chat_memory(self, chat_id: str) -> Path:
+        return ensure_memory_scaffold(self.memory_dir_for_chat(chat_id), self.config.memory_files)
+
+    def build_memory_context(self, chat_id: str, chat_state: dict[str, Any]) -> str:
+        if not self.config.memory_enabled:
+            return ""
+        index_path = self.ensure_chat_memory(chat_id)
+        memory_dir = index_path.parent
+        previous_sessions = chat_state.get("saved_sessions") or []
+        session_lines = []
+        for entry in previous_sessions[:5]:
+            session_id = entry.get("thread_id") or "(no id)"
+            name = entry.get("name") or "(untitled)"
+            saved_at = (entry.get("saved_at") or "")[:16].replace("T", " ")
+            session_lines.append(f"- {name} | id={session_id} | saved={saved_at}")
+        session_text = "\n".join(session_lines) if session_lines else "- none yet"
+        index_text = read_memory_index(index_path)
+        return (
+            "Long-term memory is available for this WhatsApp chat.\n"
+            f"Memory directory: {memory_dir}\n"
+            f"Memory index: {index_path}\n"
+            "Use these files as durable context when they are relevant. "
+            "Do not update memory files unless the user asks or a scheduled memory rollover prompt asks you to.\n"
+            "\n"
+            "Recent saved session ids:\n"
+            f"{session_text}\n"
+            "\n"
+            "Current MEMORY.md:\n"
+            f"{index_text or '[empty]'}\n"
+            "\n"
+        )
+
+    async def memory_rollover_loop(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                await self.run_due_memory_rollovers()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOG.exception("Scheduled memory rollover failed")
+            await asyncio.sleep(max(5.0, self.config.memory_check_interval))
+
+    def memory_rollover_due(self, chat_state: dict[str, Any], now: datetime) -> bool:
+        if not self.config.memory_enabled:
+            return False
+        if not (chat_state.get("thread_id") or chat_state.get("summary")):
+            return False
+
+        cutoff = datetime.combine(now.date(), self.config.memory_rollover_time, tzinfo=now.tzinfo)
+        if now < cutoff:
+            return False
+
+        date_key = now.date().isoformat()
+        if chat_state.get("last_memory_rollover_date") == date_key:
+            return False
+
+        started_raw = chat_state.get("session_started_at")
+        if started_raw:
+            try:
+                started = datetime.fromisoformat(str(started_raw))
+                if started.tzinfo is None:
+                    started = started.replace(tzinfo=now.tzinfo)
+                if started.astimezone(now.tzinfo) >= cutoff:
+                    return False
+            except ValueError:
+                pass
+        return True
+
+    async def run_due_memory_rollovers(self) -> None:
+        now = local_now()
+        chat_ids = list((self.state.data.get("chats") or {}).keys())
+        for chat_id in chat_ids:
+            chat_state = self.state.chat(chat_id)
+            if not self.memory_rollover_due(chat_state, now):
+                continue
+            lock = self.chat_locks.setdefault(chat_id, asyncio.Lock())
+            async with lock:
+                chat_state = self.state.chat(chat_id)
+                if not self.memory_rollover_due(chat_state, local_now()):
+                    continue
+                await self.rollover_memory_session(chat_id, chat_state, reason="scheduled")
+
+    def build_memory_rollover_prompt(
+        self,
+        chat_id: str,
+        chat_state: dict[str, Any],
+        memory_dir: Path,
+        index_path: Path,
+        session_id: str,
+        session_file: Path,
+    ) -> str:
+        saved_sessions = chat_state.get("saved_sessions") or []
+        saved_lines = []
+        for entry in saved_sessions[:10]:
+            saved_lines.append(
+                "- "
+                f"{entry.get('name') or '(untitled)'} | "
+                f"id={entry.get('thread_id') or '(no id)'} | "
+                f"saved={str(entry.get('saved_at') or '')[:16].replace('T', ' ')}"
+            )
+        saved_text = "\n".join(saved_lines) if saved_lines else "- none yet"
+        files = "\n".join(f"- {memory_dir / filename}" for filename in self.config.memory_files)
+        return (
+            "Scheduled daily memory rollover for this WhatsApp agent session.\n"
+            "You are currently inside the live session that is about to be archived.\n"
+            "After this, the gateway will start a new session with your carry-forward summary preloaded.\n"
+            "\n"
+            f"WhatsApp chat id: {chat_id}\n"
+            f"Current session id: {session_id or '(none)'}\n"
+            f"Current root: {chat_state.get('root', self.state.default_root)}\n"
+            f"Memory directory: {memory_dir}\n"
+            f"Memory index: {index_path}\n"
+            f"Gateway session note path: {session_file}\n"
+            "\n"
+            "Update the long-term memory files from the current conversation context.\n"
+            "Keep durable facts, preferences, project state, career/user details, decisions, constraints, and open loops.\n"
+            "Avoid transcript dumps, temporary chatter, secrets, credentials, and large logs.\n"
+            "\n"
+            "Required indexing rules:\n"
+            "- Keep MEMORY.md as the table of contents with links to topic files.\n"
+            "- Keep these core files indexed and updated when relevant:\n"
+            f"{files}\n"
+            "- Add new topic files only when they make the memory clearer, and link them from MEMORY.md.\n"
+            "- Add this session id to MEMORY.md Session History so future agents can find or resume it if needed.\n"
+            "- The gateway will write the session note after your reply; focus on MEMORY.md and topic files.\n"
+            "\n"
+            "Recent saved sessions:\n"
+            f"{saved_text}\n"
+            "\n"
+            "After editing the files, reply with a concise carry-forward summary for the next session.\n"
+            "Include: what changed in memory, previous session id, important current goals, files/repos, decisions, constraints, and open loops."
+        )
+
+    def write_memory_session_record(
+        self,
+        chat_id: str,
+        chat_state: dict[str, Any],
+        session_id: str,
+        session_file: Path,
+        update_reply: str,
+    ) -> None:
+        title = chat_state.get("title") or default_session_name()
+        root = chat_state.get("root") or self.state.default_root
+        model = chat_state.get("model") or self.config.model or "(default)"
+        session_file.parent.mkdir(parents=True, exist_ok=True)
+        session_file.write_text(
+            "# Session Memory Record\n\n"
+            f"- Chat id: `{chat_id}`\n"
+            f"- Session id: `{session_id or '(none)'}`\n"
+            f"- Title: {title}\n"
+            f"- Root: `{root}`\n"
+            f"- Model: {model}\n"
+            f"- Saved at: {now_iso()}\n\n"
+            "## Memory Update Summary\n\n"
+            f"{update_reply.strip() or 'Memory update completed.'}\n",
+            encoding="utf-8",
+        )
+
+        index_path = self.ensure_chat_memory(chat_id)
+        content = index_path.read_text(encoding="utf-8", errors="replace")
+        if "## Session History" not in content:
+            content = content.rstrip() + "\n\n## Session History\n\n"
+        rel = session_file.relative_to(index_path.parent)
+        link_marker = f"]({rel})"
+        if link_marker not in content:
+            content = (
+                content.rstrip()
+                + f"\n- {local_now().strftime('%Y-%m-%d %H:%M')} - "
+                + f"{title} | session id: `{session_id or '(none)'}` | [{rel}]({rel})\n"
+            )
+            index_path.write_text(content, encoding="utf-8")
+
+    async def rollover_memory_session(
+        self,
+        chat_id: str,
+        chat_state: dict[str, Any],
+        *,
+        reason: str,
+    ) -> str:
+        if not (chat_state.get("thread_id") or chat_state.get("summary")):
+            return "No active session to roll over."
+
+        index_path = self.ensure_chat_memory(chat_id)
+        memory_dir = index_path.parent
+        session_id = (chat_state.get("thread_id") or "").strip()
+        short_id = hashlib.sha1((session_id or now_iso()).encode("utf-8")).hexdigest()[:8]
+        session_file = (
+            memory_dir
+            / "sessions"
+            / f"{local_now().strftime('%Y-%m-%d-%H%M')}-{short_id}.md"
+        )
+        prompt = self.build_memory_rollover_prompt(
+            chat_id,
+            chat_state,
+            memory_dir,
+            index_path,
+            session_id,
+            session_file,
+        )
+        fake_event = {
+            "chatId": chat_id,
+            "senderName": "memory-rollover",
+            "senderId": "memory-rollover",
+            "body": prompt,
+            "mediaUrls": [],
+            "mediaType": "",
+        }
+        root = chat_state.get("root", self.state.default_root)
+        LOG.info("Running %s memory rollover for chat %s", reason, chat_id)
+        reply, thread_id = await self.run_agent(fake_event, chat_state, root, prompt_override=prompt)
+        if thread_id and not session_id:
+            session_id = thread_id
+            chat_state["thread_id"] = thread_id
+        self.write_memory_session_record(chat_id, chat_state, session_id, session_file, reply)
+        chat_state["summary"] = build_carry_forward_summary(reply, session_id, session_file)
+        archive_snapshot(chat_state, force=True)
+        chat_state["last_memory_rollover_date"] = local_now().date().isoformat()
+        chat_state["last_memory_rollover_at"] = now_iso()
+        chat_state["last_memory_session_id"] = session_id
+        chat_state["last_memory_dir"] = str(memory_dir)
+        clear_active_session(chat_state, keep_summary=True)
+        self.state.save()
+        return reply.strip() or "Memory updated and carry-forward summary is ready."
 
     async def handle_gateway_command(self, chat_id: str, body: str) -> bool:
         chat_state = self.state.chat(chat_id)
         parts = body.split(maxsplit=1)
         command = parts[0].lower()
         arg = parts[1].strip() if len(parts) > 1 else ""
+
+        if command in {"/yes", "/y", "/approve"}:
+            return await self.handle_upgrade_approval(chat_id, chat_state)
+
+        if command in {"/no", "/n", "/deny"}:
+            pending = chat_state.get("pending_upgrade") or {}
+            if pending.get("type") != "upgrade":
+                await self.send_message(chat_id, "Nothing is awaiting approval.")
+                return True
+            version = str(pending.get("to_version") or "")
+            if version:
+                chat_state["dismissed_upgrade_version"] = version
+            chat_state.pop("pending_upgrade", None)
+            self.state.save()
+            await self.send_message(chat_id, f"Okay, I won't ask again for version {version}.")
+            return True
 
         if command in {"/reset", "/new", "/clear"}:
             archived = archive_snapshot(chat_state)
@@ -431,9 +941,15 @@ class WhatsAppAgentGateway:
             model = chat_state.get("model") or self.config.model or "(default)"
             summary = "yes" if chat_state.get("summary") else "no"
             saved_count = len(chat_state.get("saved_sessions") or [])
+            memory = "off"
+            if self.config.memory_enabled:
+                memory = (
+                    f"{self.memory_dir_for_chat(chat_id)} "
+                    f"(rollover {self.config.memory_rollover_time_text})"
+                )
             await self.send_message(
                 chat_id,
-                f"Backend: {self.config.backend}\nRoot: {root}\nThread: {thread_id}\nModel: {model}\nSummary: {summary}\nSaved sessions: {saved_count}\nMode: {self.config.mode}",
+                f"Backend: {self.config.backend}\nRoot: {root}\nThread: {thread_id}\nModel: {model}\nSummary: {summary}\nSaved sessions: {saved_count}\nMemory: {memory}\nMode: {self.config.mode}",
             )
             return True
 
@@ -508,6 +1024,7 @@ class WhatsAppAgentGateway:
                 return True
             archive_snapshot(chat_state)
             chat_state["thread_id"] = target.get("thread_id") or ""
+            chat_state["session_started_at"] = now_iso()
             chat_state["root"] = target.get("root") or chat_state.get("root", self.state.default_root)
             if target.get("model"):
                 chat_state["model"] = target.get("model")
@@ -526,6 +1043,65 @@ class WhatsAppAgentGateway:
             )
             return True
 
+        if command in {"/memory", "/mem"}:
+            if not self.config.memory_enabled:
+                await self.send_message(chat_id, "Memory is disabled by AGENT_MEMORY_ENABLED=0.")
+                return True
+            index_path = self.ensure_chat_memory(chat_id)
+            memory_dir = index_path.parent
+            if arg.lower() in {"update", "rollover", "save"}:
+                if not (chat_state.get("thread_id") or chat_state.get("summary")):
+                    await self.send_message(chat_id, "No active session to roll over yet.")
+                    return True
+                await self.start_typing(chat_id)
+                try:
+                    reply = await self.rollover_memory_session(
+                        chat_id,
+                        chat_state,
+                        reason="manual",
+                    )
+                finally:
+                    await self.stop_typing(chat_id)
+                await self.send_message(
+                    chat_id,
+                    "Memory updated. The next session will start with this carry-forward summary.\n\n"
+                    + reply,
+                )
+                return True
+            last_rollover = chat_state.get("last_memory_rollover_at") or "(never)"
+            last_session = chat_state.get("last_memory_session_id") or "(none)"
+            active_session = chat_state.get("thread_id") or "(none)"
+            await self.send_message(
+                chat_id,
+                f"Memory dir: {memory_dir}\n"
+                f"Index: {index_path}\n"
+                f"Rollover time: {self.config.memory_rollover_time_text}\n"
+                f"Active session id: {active_session}\n"
+                f"Last archived session id: {last_session}\n"
+                f"Last rollover: {last_rollover}\n"
+                "Use `/memory update` to update memory and roll into a summarized next session now.",
+            )
+            return True
+
+        if command == "/rollover":
+            if not self.config.memory_enabled:
+                await self.send_message(chat_id, "Memory is disabled by AGENT_MEMORY_ENABLED=0.")
+                return True
+            if not (chat_state.get("thread_id") or chat_state.get("summary")):
+                await self.send_message(chat_id, "No active session to roll over yet.")
+                return True
+            await self.start_typing(chat_id)
+            try:
+                reply = await self.rollover_memory_session(chat_id, chat_state, reason="manual")
+            finally:
+                await self.stop_typing(chat_id)
+            await self.send_message(
+                chat_id,
+                "Memory updated. The next session will start with this carry-forward summary.\n\n"
+                + reply,
+            )
+            return True
+
         if command == "/help":
             await self.send_message(
                 chat_id,
@@ -536,11 +1112,64 @@ class WhatsAppAgentGateway:
                 "/root /path switches the project root for this chat.\n"
                 "/model <name> switches the model for this chat.\n"
                 "/compact rolls the active thread into a carry-forward summary.\n"
+                "/memory shows the long-term memory index path.\n"
+                "/memory update saves memory and rolls into a summarized next session now.\n"
+                "/yes approves a pending gateway action like an upgrade.\n"
+                "/no dismisses a pending gateway action.\n"
                 "/reset clears the live thread immediately.",
             )
             return True
 
         return False
+
+    async def handle_upgrade_approval(
+        self, chat_id: str, chat_state: dict[str, Any]
+    ) -> bool:
+        pending = chat_state.get("pending_upgrade") or {}
+        if pending.get("type") != "upgrade":
+            await self.send_message(chat_id, "Nothing is awaiting approval.")
+            return True
+
+        latest = str(pending.get("to_version") or "")
+        current = str(pending.get("from_version") or self.config.package_version)
+        command = str(pending.get("command") or self.upgrade_command())
+        chat_state.pop("pending_upgrade", None)
+        self.state.save()
+
+        root = chat_state.get("root", self.state.default_root)
+        prompt = build_upgrade_prompt(current, latest, command)
+        fake_event = {
+            "chatId": chat_id,
+            "senderName": "gateway",
+            "senderId": "gateway",
+            "body": prompt,
+            "mediaUrls": [],
+            "mediaType": "",
+        }
+
+        await self.send_message(chat_id, f"Approved. Starting upgrade to {latest}.")
+        await self.start_typing(chat_id)
+        try:
+            reply, thread_id = await self.run_agent(
+                fake_event,
+                chat_state,
+                root,
+                prompt_override=prompt,
+            )
+        finally:
+            await self.stop_typing(chat_id)
+
+        if thread_id and chat_state.get("thread_id") != thread_id:
+            chat_state["thread_id"] = thread_id
+            chat_state.setdefault("session_started_at", now_iso())
+            self.state.save()
+        elif thread_id and not chat_state.get("session_started_at"):
+            chat_state["session_started_at"] = now_iso()
+            self.state.save()
+
+        for chunk in split_message(reply, self.config.max_reply_chars):
+            await self.send_message(chat_id, chunk)
+        return True
 
     async def compact_session(
         self, chat_id: str, chat_state: dict[str, Any]
@@ -599,6 +1228,10 @@ class WhatsAppAgentGateway:
                 + (f"Session title: {title}\n\n" if title else "")
                 + prompt
             )
+        if prompt_override is None and self.config.memory_enabled:
+            memory_context = self.build_memory_context(str(event["chatId"]), chat_state)
+            if memory_context:
+                prompt = memory_context + "\n" + prompt
         existing_thread = chat_state.get("thread_id")
         out_path = Path(tempfile.mkstemp(prefix="codex-wa-", suffix=".txt")[1])
         args = [self.config.agent_command, "exec"]
@@ -642,7 +1275,7 @@ class WhatsAppAgentGateway:
             combined = "\n".join(part for part in [stderr_text.strip(), stdout_text.strip()] if part).lower()
             if existing_thread and ("session" in combined and "not found" in combined):
                 chat_state.pop("thread_id", None)
-                return await self.run_codex(event, chat_state, root)
+                return await self.run_codex(event, chat_state, root, prompt_override=prompt_override)
             detail = stderr_text.strip() or stdout_text.strip() or "Codex exited with an unknown error."
             reply = reply or f"Codex failed:\n{detail[:1500]}"
 
@@ -672,6 +1305,10 @@ class WhatsAppAgentGateway:
                 + (f"Session title: {title}\n\n" if title else "")
                 + prompt
             )
+        if prompt_override is None and self.config.memory_enabled:
+            memory_context = self.build_memory_context(str(event["chatId"]), chat_state)
+            if memory_context:
+                prompt = memory_context + "\n" + prompt
 
         existing_thread = (chat_state.get("thread_id") or "").strip()
         thread_id = existing_thread or str(uuid4())
@@ -685,6 +1322,10 @@ class WhatsAppAgentGateway:
             "--add-dir",
             str(root),
         ]
+        if self.config.memory_enabled:
+            memory_dir = self.memory_dir_for_chat(str(event["chatId"]))
+            if str(memory_dir) != str(root):
+                args.extend(["--add-dir", str(memory_dir)])
         if existing_thread:
             args.extend(["--resume", existing_thread])
         else:
