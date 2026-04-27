@@ -679,7 +679,7 @@ print_finished() {
     fi
     note "Send a message from an allowed number to test it."
   else
-    note "Pair when you're ready: ${BOLD}bash $INSTALL_DIR/scripts/pair.sh${RESET}"
+    note "Pair when you're ready: ${BOLD}whatsapp-agent pair${RESET}"
   fi
 
   printf '\n  %s%s%s\n' "$BOLD" "Cheatsheet" "$RESET"
@@ -694,7 +694,7 @@ print_finished() {
     "$DIM" "$INSTALL_DIR" "$RESET"
 
   printf '  %sRe-pair WhatsApp%s  %s(switched phone, lost session)%s\n' "$BOLD" "$RESET" "$DIM" "$RESET"
-  printf '    bash %s/scripts/pair.sh\n\n' "$INSTALL_DIR"
+  printf '    whatsapp-agent pair\n\n'
 
   if [[ $has_systemctl -eq 1 ]]; then
     printf '  %sService control%s\n' "$BOLD" "$RESET"

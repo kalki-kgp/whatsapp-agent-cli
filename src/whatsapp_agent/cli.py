@@ -116,11 +116,25 @@ def cmd_install(args: argparse.Namespace) -> int:
 
 def cmd_pair(args: argparse.Namespace) -> int:
     install_dir = Path(args.install_dir or DEFAULT_INSTALL_DIR)
+    env_file = install_dir / ".env"
     script = install_dir / "scripts" / "pair.sh"
-    if not script.exists():
-        _fail(f"Pair script not found at {script}.")
-        _warn("Run `whatsapp-agent install` first.")
+    if not env_file.exists():
+        _fail(f"No configured install found at {install_dir}.")
+        _warn("Run `whatsapp-agent install` first, then `whatsapp-agent pair`.")
         return 1
+    if not script.exists():
+        _warn(f"Pair script missing at {script}; repairing runtime files.")
+        try:
+            _sync_runtime(install_dir)
+        except Exception as exc:
+            _fail(f"Could not repair runtime files: {exc}")
+            _warn("Run `whatsapp-agent install --reconfigure` to rebuild the runtime.")
+            return 1
+        if not script.exists():
+            _fail(f"Pair script still missing at {script}.")
+            _warn("Run `whatsapp-agent install --reconfigure` to rebuild the runtime.")
+            return 1
+        _ok("runtime files repaired")
     return _exec_bash(script, [], env={"AGENT_WHATSAPP_HOME": str(install_dir)})
 
 
@@ -227,6 +241,8 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
         _warn(f"install dir not found: {install_dir}")
 
     _ok("uninstall complete")
+    _warn("The whatsapp-agent CLI is still installed. Run `whatsapp-agent install` before pairing again.")
+    _warn("To remove the CLI too, run `uv tool uninstall whatsapp-agent-cli`.")
     return 0
 
 
