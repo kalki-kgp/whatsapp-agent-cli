@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import shlex
+import shutil
 import signal
 import tempfile
 import time
@@ -81,6 +82,17 @@ def is_newer_version(latest: str, current: str) -> bool:
     return latest_parts > current_parts
 
 
+def is_same_or_newer_version(current: str, target: str) -> bool:
+    current_parts = _version_numbers(current)
+    target_parts = _version_numbers(target)
+    if not current_parts or not target_parts:
+        return False
+    width = max(len(current_parts), len(target_parts))
+    current_parts.extend([0] * (width - len(current_parts)))
+    target_parts.extend([0] * (width - len(target_parts)))
+    return current_parts >= target_parts
+
+
 def parse_daily_time(value: str) -> datetime_time:
     raw = (value or "04:00").strip()
     try:
@@ -93,21 +105,6 @@ def parse_daily_time(value: str) -> datetime_time:
         pass
     LOG.warning("Invalid AGENT_MEMORY_ROLLOVER_TIME=%r, using 04:00", value)
     return datetime_time(hour=4, minute=0)
-
-
-def build_upgrade_prompt(current: str, latest: str, command: str) -> str:
-    return (
-        "The WhatsApp operator approved upgrading this whatsapp-agent-cli runtime.\n"
-        f"Current installed version: {current or '(unknown)'}\n"
-        f"Latest available version: {latest}\n"
-        "\n"
-        "Run the upgrade command below, verify the installed version if the process survives, and keep the reply concise.\n"
-        "The command upgrades the persistent uv tool, syncs the runtime, and restarts the systemd user service.\n"
-        "If restarting the service interrupts this chat response, that is expected and acceptable.\n"
-        "\n"
-        f"Command:\n{command}\n"
-    )
-
 
 class Config:
     def __init__(self) -> None:
@@ -617,12 +614,16 @@ class WhatsAppAgentGateway:
         self.whisper_lock = asyncio.Lock()
 
     def upgrade_command(self) -> str:
+        uv_bin = shutil.which("uv") or str(Path.home() / ".local" / "bin" / "uv")
+        agent_bin = shutil.which("whatsapp-agent") or str(
+            Path.home() / ".local" / "bin" / "whatsapp-agent"
+        )
         install_dir = shlex.quote(str(self.config.home))
         service = shlex.quote(f"{self.config.service_name}.service")
         return (
-            "uv tool install --upgrade whatsapp-agent-cli && "
+            f"{shlex.quote(uv_bin)} tool install --upgrade whatsapp-agent-cli && "
             "(hash -r 2>/dev/null || true) && "
-            f"whatsapp-agent --install-dir {install_dir} install --reconfigure && "
+            f"{shlex.quote(agent_bin)} --install-dir {install_dir} install --reconfigure && "
             f"systemctl --user restart {service}"
         )
 
@@ -630,6 +631,7 @@ class WhatsAppAgentGateway:
         self.config.ensure_dirs()
         self.http = aiohttp.ClientSession()
         await self.start_bridge()
+        await self.send_upgrade_completion_notices()
         if self.config.upgrade_check:
             self.upgrade_task = asyncio.create_task(self.upgrade_notice_loop())
         if self.config.memory_enabled:
@@ -918,7 +920,7 @@ class WhatsAppAgentGateway:
         return (
             f"Upgrade available: whatsapp-agent-cli {current} -> {latest}.\n"
             "Reply /yes to approve the upgrade, or /no to dismiss this version.\n"
-            f"I will ask the agent to run: {pending['command']}"
+            f"I will run: {pending['command']}"
         )
 
     async def refresh_upgrade_notice(self, *, force: bool = False) -> None:
@@ -1008,6 +1010,52 @@ class WhatsAppAgentGateway:
                     chat_state.pop("pending_upgrade", None)
                     self.state.save()
                 LOG.exception("Failed to send proactive upgrade notice chat=%s", chat_id)
+
+    async def send_upgrade_completion_notices(self) -> None:
+        current = self.config.package_version
+        chats = self.state.data.get("chats") or {}
+        for chat_id, chat_state in chats.items():
+            upgrade = chat_state.get("upgrade_in_progress") or {}
+            target = str(upgrade.get("to_version") or "").strip()
+            if not target:
+                continue
+
+            if is_same_or_newer_version(current, target):
+                chat_state.pop("upgrade_in_progress", None)
+                chat_state.pop("pending_upgrade", None)
+                self.state.save()
+                await self.send_message(
+                    chat_id,
+                    f"Upgrade complete: whatsapp-agent-cli {current}.",
+                )
+                continue
+
+            started_at = str(upgrade.get("started_at") or "")
+            try:
+                started = datetime.fromisoformat(started_at)
+            except ValueError:
+                started = None
+            if started and (datetime.now(UTC) - started).total_seconds() < 600:
+                continue
+
+            chat_state.pop("upgrade_in_progress", None)
+            self.state.save()
+            await self.send_message(
+                chat_id,
+                f"Upgrade to whatsapp-agent-cli {target} did not complete. "
+                f"This runtime is still {current or '(unknown)'}. Check logs/upgrade.log.",
+            )
+
+    async def launch_upgrade_command(self, command: str) -> None:
+        log_path = self.config.logs_dir / "upgrade.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        wrapped = f"nohup sh -lc {shlex.quote(command)} >> {shlex.quote(str(log_path))} 2>&1 &"
+        proc = await asyncio.create_subprocess_shell(
+            wrapped,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc.communicate()
 
     def memory_dir_for_chat(self, chat_id: str) -> Path:
         return self.config.memory_dir / chat_memory_slug(chat_id)
@@ -1495,43 +1543,22 @@ class WhatsAppAgentGateway:
         current = str(pending.get("from_version") or self.config.package_version)
         command = str(pending.get("command") or self.upgrade_command())
         chat_state.pop("pending_upgrade", None)
+        chat_state["upgrade_in_progress"] = {
+            "from_version": current,
+            "to_version": latest,
+            "command": command,
+            "started_at": now_iso(),
+        }
         self.state.save()
 
-        root = chat_state.get("root", self.state.default_root)
-        prompt = build_upgrade_prompt(current, latest, command)
-        fake_event = {
-            "chatId": chat_id,
-            "senderName": "gateway",
-            "senderId": "gateway",
-            "body": prompt,
-            "mediaUrls": [],
-            "mediaType": "",
-        }
-
         await self.send_message(chat_id, f"Approved. Starting upgrade to {latest}.")
-        await self.start_typing(chat_id)
         try:
-            reply, thread_id = await self.run_agent(
-                fake_event,
-                chat_state,
-                root,
-                prompt_override=prompt,
-            )
-        finally:
-            await self.stop_typing(chat_id)
-
-        if thread_id and chat_state.get("thread_id") != thread_id:
-            chat_state["thread_id"] = thread_id
-            chat_state["backend"] = self.config.backend
-            chat_state.setdefault("session_started_at", now_iso())
+            await self.launch_upgrade_command(command)
+        except Exception:
+            chat_state.pop("upgrade_in_progress", None)
             self.state.save()
-        elif thread_id and not chat_state.get("session_started_at"):
-            chat_state["backend"] = self.config.backend
-            chat_state["session_started_at"] = now_iso()
-            self.state.save()
-
-        for chunk in split_message(reply, self.config.max_reply_chars):
-            await self.send_message(chat_id, chunk)
+            LOG.exception("Failed to launch upgrade command")
+            await self.send_message(chat_id, "Failed to launch the upgrade command. Check gateway logs.")
         return True
 
     async def compact_session(
