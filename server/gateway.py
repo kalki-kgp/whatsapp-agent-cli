@@ -101,8 +101,9 @@ def build_upgrade_prompt(current: str, latest: str, command: str) -> str:
         f"Current installed version: {current or '(unknown)'}\n"
         f"Latest available version: {latest}\n"
         "\n"
-        "Run the upgrade command below, verify the result, and keep the reply concise.\n"
-        "If restarting the service interrupts this chat response, that is acceptable.\n"
+        "Run the upgrade command below, verify the installed version if the process survives, and keep the reply concise.\n"
+        "The command upgrades the persistent uv tool, syncs the runtime, and restarts the systemd user service.\n"
+        "If restarting the service interrupts this chat response, that is expected and acceptable.\n"
         "\n"
         f"Command:\n{command}\n"
     )
@@ -577,8 +578,9 @@ class WhatsAppAgentGateway:
         install_dir = shlex.quote(str(self.config.home))
         service = shlex.quote(f"{self.config.service_name}.service")
         return (
-            "uvx --upgrade --from whatsapp-agent-cli whatsapp-agent "
-            f"--install-dir {install_dir} install --reconfigure && "
+            "uv tool install --upgrade whatsapp-agent-cli && "
+            "(hash -r 2>/dev/null || true) && "
+            f"whatsapp-agent --install-dir {install_dir} install --reconfigure && "
             f"systemctl --user restart {service}"
         )
 
