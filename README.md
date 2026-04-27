@@ -34,7 +34,15 @@ You (WhatsApp)  ──▶  Baileys bridge  ──▶  gateway  ──▶  codex 
 
 ## Install
 
-The fastest path — one command, zero clones:
+The fastest path — one command, zero clones, no system `pip`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kalki-kgp/whatsapp-agent-cli/main/scripts/bootstrap.sh | bash
+```
+
+This works on newer Debian/Ubuntu releases where `pip install ...` is blocked by PEP 668. The bootstrap installs `uv` into your user account if needed, checks Node/npm, then runs the real installer from PyPI.
+
+If you already have `uv`, this is the same as:
 
 ```bash
 uvx whatsapp-agent-cli install
@@ -46,8 +54,8 @@ Or install the CLI persistently:
 # uv (recommended)
 uv tool install whatsapp-agent-cli
 
-# pip
-pip install whatsapp-agent-cli
+# pipx
+pipx install whatsapp-agent-cli
 ```
 
 Then run:
@@ -76,6 +84,13 @@ WHATSAPP_ALLOWED_USERS=919876543210 \ (Your WhatsApp number with country code)
 ```
 
 Reads from env vars (`AGENT_BACKEND`, `AGENT_COMMAND`, `WHATSAPP_MODE`, `WHATSAPP_PORT`, `AGENT_ROOT`, `AGENT_MODEL`) and falls back to auto-detection. Only `WHATSAPP_ALLOWED_USERS` is mandatory.
+
+With the bootstrap installer:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kalki-kgp/whatsapp-agent-cli/main/scripts/bootstrap.sh \
+  | WHATSAPP_ALLOWED_USERS=919876543210 bash -s -- install --non-interactive
+```
 
 ### From source
 
