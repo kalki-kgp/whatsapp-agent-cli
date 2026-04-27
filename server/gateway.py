@@ -140,6 +140,8 @@ class Config:
         self.allowed_users = os.getenv("WHATSAPP_ALLOWED_USERS", "").strip()
         self.mode = os.getenv("WHATSAPP_MODE", "bot").strip() or "bot"
         self.max_reply_chars = int(os.getenv("CW_MAX_REPLY_CHARS", "3500"))
+        self.send_retry_seconds = float(os.getenv("CW_SEND_RETRY_SECONDS", "60"))
+        self.send_retry_interval = float(os.getenv("CW_SEND_RETRY_INTERVAL", "2"))
         self.logs_dir = self.home / "logs"
         self.bridge_log = self.logs_dir / "bridge.log"
         self.processed_limit = int(os.getenv("CW_PROCESSED_LIMIT", "2000"))
@@ -703,10 +705,13 @@ class WhatsAppAgentGateway:
                 self.state.save()
             except Exception:
                 LOG.exception("Failed to process message %s", message_id)
-                await self.send_message(
-                    event["chatId"],
-                    "That run blew up on the server. Check the gateway logs and try again.",
-                )
+                try:
+                    await self.send_message(
+                        event["chatId"],
+                        "That run blew up on the server. Check the gateway logs and try again.",
+                    )
+                except Exception:
+                    LOG.exception("Also failed to send the error message for %s", message_id)
 
     async def process_message(self, event: dict[str, Any]) -> None:
         chat_id = str(event["chatId"])
@@ -1592,14 +1597,30 @@ class WhatsAppAgentGateway:
 
     async def send_message(self, chat_id: str, message: str) -> None:
         assert self.http is not None
-        async with self.http.post(
-            f"http://127.0.0.1:{self.config.bridge_port}/send",
-            json={"chatId": chat_id, "message": message},
-            timeout=aiohttp.ClientTimeout(total=30),
-        ) as resp:
-            if resp.status != 200:
-                detail = await resp.text()
-                raise RuntimeError(f"Bridge send failed: {resp.status} {detail}")
+        url = f"http://127.0.0.1:{self.config.bridge_port}/send"
+        deadline = time.monotonic() + self.config.send_retry_seconds
+        last_error = ""
+
+        while True:
+            try:
+                async with self.http.post(
+                    url,
+                    json={"chatId": chat_id, "message": message},
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as resp:
+                    if resp.status == 200:
+                        return
+                    detail = await resp.text()
+                    last_error = f"Bridge send failed: {resp.status} {detail}"
+                    if resp.status < 500 or time.monotonic() >= deadline:
+                        raise RuntimeError(last_error)
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                last_error = f"Bridge send failed: {exc}"
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(last_error) from exc
+
+            LOG.warning("Bridge not ready for send to %s; retrying: %s", chat_id, last_error)
+            await asyncio.sleep(self.config.send_retry_interval)
 
     async def send_typing(self, chat_id: str) -> None:
         assert self.http is not None

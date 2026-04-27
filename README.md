@@ -180,6 +180,8 @@ Settings live in `~/.agent-whatsapp/.env`. Edit by hand or re-run `whatsapp-agen
 | `WHATSAPP_ALLOWED_USERS` | Comma-separated phone numbers / LIDs allowed to message the bridge |
 | `WHATSAPP_PORT` | Local bridge HTTP port (default `3010`) |
 | `CW_LOG_LEVEL` | Python log level (default `INFO`) |
+| `CW_SEND_RETRY_SECONDS` | How long gateway replies retry while WhatsApp reconnects, default `60` |
+| `CW_SEND_RETRY_INTERVAL` | Seconds between send retries, default `2` |
 | `AGENT_MEMORY_ENABLED` | Set to `0` to disable long-term memory and daily rollovers |
 | `AGENT_MEMORY_DIR` | Memory root; each chat gets a folder containing `MEMORY.md` |
 | `AGENT_MEMORY_ROLLOVER_TIME` | Daily local time, `HH:MM`, to update memory and roll sessions forward |
