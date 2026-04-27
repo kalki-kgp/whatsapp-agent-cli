@@ -347,12 +347,12 @@ def read_memory_index(index_path: Path, limit: int = 6000) -> str:
 def build_carry_forward_summary(update_reply: str, session_id: str, session_file: Path) -> str:
     summary = update_reply.strip() or "Memory rollover completed."
     return (
-        "Carry-forward context from the previous WhatsApp agent session.\n"
-        f"Previous session id: {session_id or '(none)'}\n"
-        f"Previous session memory record: {session_file}\n"
+        "Carry-forward context for this WhatsApp agent session.\n"
+        f"Session id: {session_id or '(none)'}\n"
+        f"Session memory record: {session_file}\n"
         "\n"
-        "Use this as the starting context for the new session. Read the memory index "
-        "or previous session only when more detail is needed.\n"
+        "Use this as the compacted context for continued work. Read the memory index "
+        "or session record only when more detail is needed.\n"
         "\n"
         f"{summary}"
     )
@@ -402,10 +402,23 @@ def clear_active_session(chat_state: dict[str, Any], *, keep_summary: bool = Fal
 
 def format_saved_sessions(chat_state: dict[str, Any]) -> str:
     saved = chat_state.get("saved_sessions") or []
-    if not saved:
+    active_id = (chat_state.get("thread_id") or "").strip()
+    active_title = (chat_state.get("title") or "").strip()
+    active_summary = (chat_state.get("summary") or "").strip()
+    if not saved and not active_id and not active_title and not active_summary:
         return "No saved sessions yet."
-    lines = ["Saved sessions:"]
-    for entry in saved[:10]:
+    lines = ["Available sessions:"]
+    if active_id or active_title or active_summary:
+        name = active_title or "(untitled)"
+        thread_id = active_id or "(no id yet)"
+        model = chat_state.get("model") or "(default)"
+        root = chat_state.get("root") or "(root unset)"
+        started = str(chat_state.get("session_started_at") or "")[:16].replace("T", " ")
+        suffix = f" | started={started}" if started else ""
+        lines.append(f"- current: {name} | id={thread_id} | model={model} | root={root}{suffix}")
+    for entry in saved:
+        if active_id and entry.get("thread_id") == active_id:
+            continue
         name = entry.get("name") or "(untitled)"
         thread_id = entry.get("thread_id") or "(no id)"
         model = entry.get("model") or "(default)"
@@ -413,6 +426,7 @@ def format_saved_sessions(chat_state: dict[str, Any]) -> str:
         saved_at = entry.get("saved_at", "")[:16].replace("T", " ")
         lines.append(f"- {name} | id={thread_id} | model={model} | root={root} | {saved_at}")
     lines.append("Use `/resume <name>` or `/resume <id>` to switch back.")
+    lines.append("Use `/search-session <query>` when you only remember part of the work.")
     return "\n".join(lines)
 
 
@@ -431,6 +445,67 @@ def resolve_saved_session(chat_state: dict[str, Any], query: str) -> dict[str, A
         if needle == (entry.get("thread_id") or "").lower():
             return entry
     return None
+
+
+def session_search_blob(entry: dict[str, Any]) -> str:
+    fields = [
+        entry.get("name") or "",
+        entry.get("thread_id") or "",
+        entry.get("root") or "",
+        entry.get("model") or "",
+        entry.get("summary") or "",
+        entry.get("session_started_at") or "",
+        entry.get("saved_at") or "",
+    ]
+    return "\n".join(str(field) for field in fields if field)
+
+
+def score_saved_session(entry: dict[str, Any], query: str) -> int:
+    needle = query.strip().lower()
+    if not needle:
+        return 0
+    name = str(entry.get("name") or "").lower()
+    thread_id = str(entry.get("thread_id") or "").lower()
+    root = str(entry.get("root") or "").lower()
+    summary = str(entry.get("summary") or "").lower()
+    blob = session_search_blob(entry).lower()
+    tokens = [token for token in re.split(r"[^a-z0-9_.:/-]+", needle) if token]
+
+    score = 0
+    if name == needle:
+        score += 200
+    if thread_id == needle:
+        score += 180
+    if needle in name:
+        score += 90
+    if needle in thread_id:
+        score += 80
+    if needle in root:
+        score += 35
+    if needle in summary:
+        score += 25
+    for token in tokens:
+        if token in name:
+            score += 25
+        if token in root:
+            score += 12
+        if token in summary:
+            score += 8
+        if token in blob:
+            score += 3
+    return score
+
+
+def search_saved_sessions(
+    chat_state: dict[str, Any], query: str, *, limit: int = 5
+) -> list[tuple[int, dict[str, Any]]]:
+    ranked: list[tuple[int, dict[str, Any]]] = []
+    for entry in chat_state.get("saved_sessions") or []:
+        score = score_saved_session(entry, query)
+        if score > 0:
+            ranked.append((score, entry))
+    ranked.sort(key=lambda item: (item[0], item[1].get("saved_at") or ""), reverse=True)
+    return ranked[:limit]
 
 
 class WhatsAppAgentGateway:
@@ -785,8 +860,8 @@ class WhatsAppAgentGateway:
         files = "\n".join(f"- {memory_dir / filename}" for filename in self.config.memory_files)
         return (
             "Scheduled daily memory rollover for this WhatsApp agent session.\n"
-            "You are currently inside the live session that is about to be archived.\n"
-            "After this, the gateway will start a new session with your carry-forward summary preloaded.\n"
+            "You are currently inside the live session that is being compacted in place.\n"
+            "After this, the gateway will keep the same session id and continue with the updated carry-forward summary.\n"
             "\n"
             f"WhatsApp chat id: {chat_id}\n"
             f"Current session id: {session_id or '(none)'}\n"
@@ -810,7 +885,7 @@ class WhatsAppAgentGateway:
             "Recent saved sessions:\n"
             f"{saved_text}\n"
             "\n"
-            "After editing the files, reply with a concise carry-forward summary for the next session.\n"
+            "After editing the files, reply with a concise carry-forward summary for this ongoing session.\n"
             "Include: what changed in memory, previous session id, important current goals, files/repos, decisions, constraints, and open loops."
         )
 
@@ -901,9 +976,25 @@ class WhatsAppAgentGateway:
         chat_state["last_memory_rollover_at"] = now_iso()
         chat_state["last_memory_session_id"] = session_id
         chat_state["last_memory_dir"] = str(memory_dir)
-        clear_active_session(chat_state, keep_summary=True)
         self.state.save()
         return reply.strip() or "Memory updated and carry-forward summary is ready."
+
+    def restore_saved_session(
+        self, chat_state: dict[str, Any], target: dict[str, Any]
+    ) -> None:
+        chat_state["thread_id"] = target.get("thread_id") or ""
+        chat_state["session_started_at"] = target.get("session_started_at") or now_iso()
+        chat_state["root"] = target.get("root") or chat_state.get("root", self.state.default_root)
+        if target.get("model"):
+            chat_state["model"] = target.get("model")
+        else:
+            chat_state.pop("model", None)
+        if target.get("summary"):
+            chat_state["summary"] = target.get("summary")
+        else:
+            chat_state.pop("summary", None)
+        if target.get("name"):
+            chat_state["title"] = target.get("name")
 
     async def handle_gateway_command(self, chat_id: str, body: str) -> bool:
         chat_state = self.state.chat(chat_id)
@@ -984,7 +1075,7 @@ class WhatsAppAgentGateway:
             self.state.save()
             await self.send_message(
                 chat_id,
-                "Context compacted into a carry-forward summary. Next turns will start fresh but keep the important bits.\n\n"
+                "Context compacted into a carry-forward summary for this same session.\n\n"
                 + summary,
             )
             return True
@@ -1010,12 +1101,15 @@ class WhatsAppAgentGateway:
                 await self.send_message(chat_id, f"Current title: {current}")
                 return True
             chat_state["title"] = arg
+            archive_snapshot(chat_state)
             self.state.save()
             await self.send_message(chat_id, f"Title set to: {arg}")
             return True
 
         if command == "/resume":
             if not arg:
+                archive_snapshot(chat_state)
+                self.state.save()
                 await self.send_message(chat_id, format_saved_sessions(chat_state))
                 return True
             target = resolve_saved_session(chat_state, arg)
@@ -1023,23 +1117,38 @@ class WhatsAppAgentGateway:
                 await self.send_message(chat_id, "Couldn’t find that saved session. Use `/resume` with no args to list them.")
                 return True
             archive_snapshot(chat_state)
-            chat_state["thread_id"] = target.get("thread_id") or ""
-            chat_state["session_started_at"] = now_iso()
-            chat_state["root"] = target.get("root") or chat_state.get("root", self.state.default_root)
-            if target.get("model"):
-                chat_state["model"] = target.get("model")
-            else:
-                chat_state.pop("model", None)
-            if target.get("summary"):
-                chat_state["summary"] = target.get("summary")
-            else:
-                chat_state.pop("summary", None)
-            if target.get("name"):
-                chat_state["title"] = target.get("name")
+            self.restore_saved_session(chat_state, target)
             self.state.save()
             await self.send_message(
                 chat_id,
                 f"Resumed: {target.get('name') or '(untitled)'}",
+            )
+            return True
+
+        if command in {"/search-session", "/search-sessions", "/sessions"}:
+            if not arg:
+                await self.send_message(chat_id, "Usage: /search-session <query>")
+                return True
+            archive_snapshot(chat_state)
+            matches = search_saved_sessions(chat_state, arg, limit=5)
+            if not matches:
+                await self.send_message(chat_id, f"No saved session matched: {arg}")
+                self.state.save()
+                return True
+            target = matches[0][1]
+            archive_snapshot(chat_state)
+            self.restore_saved_session(chat_state, target)
+            self.state.save()
+            alternatives = []
+            for score, entry in matches[1:4]:
+                name = entry.get("name") or "(untitled)"
+                thread_id = entry.get("thread_id") or "(no id)"
+                alternatives.append(f"- {name} | id={thread_id} | score={score}")
+            alt_text = "\n\nOther matches:\n" + "\n".join(alternatives) if alternatives else ""
+            await self.send_message(
+                chat_id,
+                f"Resumed best match for `{arg}`: {target.get('name') or '(untitled)'}"
+                + alt_text,
             )
             return True
 
@@ -1064,7 +1173,7 @@ class WhatsAppAgentGateway:
                     await self.stop_typing(chat_id)
                 await self.send_message(
                     chat_id,
-                    "Memory updated. The next session will start with this carry-forward summary.\n\n"
+                    "Memory updated. This same session will continue with the carry-forward summary.\n\n"
                     + reply,
                 )
                 return True
@@ -1077,9 +1186,9 @@ class WhatsAppAgentGateway:
                 f"Index: {index_path}\n"
                 f"Rollover time: {self.config.memory_rollover_time_text}\n"
                 f"Active session id: {active_session}\n"
-                f"Last archived session id: {last_session}\n"
+                f"Last compacted session id: {last_session}\n"
                 f"Last rollover: {last_rollover}\n"
-                "Use `/memory update` to update memory and roll into a summarized next session now.",
+                "Use `/memory update` to update memory and compact this session now.",
             )
             return True
 
@@ -1097,7 +1206,7 @@ class WhatsAppAgentGateway:
                 await self.stop_typing(chat_id)
             await self.send_message(
                 chat_id,
-                "Memory updated. The next session will start with this carry-forward summary.\n\n"
+                "Memory updated. This same session will continue with the carry-forward summary.\n\n"
                 + reply,
             )
             return True
@@ -1111,9 +1220,10 @@ class WhatsAppAgentGateway:
                 "/title <name> names the current session.\n"
                 "/root /path switches the project root for this chat.\n"
                 "/model <name> switches the model for this chat.\n"
-                "/compact rolls the active thread into a carry-forward summary.\n"
+                "/compact writes a carry-forward summary while keeping this session.\n"
                 "/memory shows the long-term memory index path.\n"
-                "/memory update saves memory and rolls into a summarized next session now.\n"
+                "/memory update saves memory and compacts this session now.\n"
+                "/search-session <query> finds and resumes the best matching saved session.\n"
                 "/yes approves a pending gateway action like an upgrade.\n"
                 "/no dismisses a pending gateway action.\n"
                 "/reset clears the live thread immediately.",
@@ -1192,9 +1302,8 @@ class WhatsAppAgentGateway:
             "mediaType": "",
         }
         summary, _ = await self.run_agent(fake_event, chat_state, root, prompt_override=prompt)
-        archive_snapshot(chat_state, force=True)
         chat_state["summary"] = summary.strip()
-        clear_active_session(chat_state, keep_summary=True)
+        archive_snapshot(chat_state, force=True)
         return summary.strip(), None
 
     async def run_agent(

@@ -151,14 +151,15 @@ Send these as WhatsApp messages from any allowed number:
 | `/status` | Backend, root, active thread, model, summary state, saved-session count |
 | `/new` (or `/clear`) | Archive the current session, start fresh |
 | `/reset` | Clear the live session immediately |
-| `/resume` | List saved sessions for this chat |
-| `/resume <name>` | Restore a saved session by name |
-| `/title <name>` | Name the current session |
+| `/resume` | List the current session plus all saved sessions for this chat |
+| `/resume <name>` | Restore a saved session by name or id |
+| `/search-session <query>` | Find and resume the most relevant saved session |
+| `/title <name>` | Name the current session; this is the session name shown by `/resume` |
 | `/root /abs/path` | Change the working directory for this chat |
 | `/model <name>` | Change the model for this chat |
-| `/compact` | Roll the conversation into a carry-forward summary |
+| `/compact` | Write a carry-forward summary while keeping the same session id |
 | `/memory` | Show this chat's long-term memory index and session ids |
-| `/memory update` | Update memory files, archive the active session, and preload the next session summary |
+| `/memory update` | Update memory files and compact the active session in place |
 | `/yes` | Approve a pending gateway action, such as a package upgrade |
 | `/no` | Dismiss a pending gateway action |
 | `/help` | Show the command list |
@@ -197,7 +198,7 @@ When the gateway sees a newer `whatsapp-agent-cli` release on PyPI, it appends a
 
 ## Long-Term Memory
 
-Memory is enabled by default. At `AGENT_MEMORY_ROLLOVER_TIME` each day, the gateway finds active chats whose current session started before that time, asks the live agent session to update long-term memory files and write a carry-forward summary, archives the current session id, and starts the next session with that summary preloaded.
+Memory is enabled by default. At `AGENT_MEMORY_ROLLOVER_TIME` each day, the gateway finds active chats whose current session started before that time, asks the live agent session to update long-term memory files and write a carry-forward summary, and keeps the same session id active with that summary preloaded.
 
 Each chat gets its own folder under `AGENT_MEMORY_DIR`:
 
@@ -212,7 +213,7 @@ memory/<chat-id-hash>/
   sessions/
 ```
 
-`MEMORY.md` is the index. Topic files hold the details, and `sessions/` stores daily rollover records with the archived session id. Send `/memory` to see the paths and active/previous session ids, or `/memory update` to force the rollover and summary handoff immediately.
+`MEMORY.md` is the index. Topic files hold the details, and `sessions/` stores daily rollover records with the compacted session id. Send `/memory` to see the paths and active/previous session ids, or `/memory update` to force the memory update and in-place compaction immediately.
 
 ## Troubleshooting
 
