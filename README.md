@@ -109,7 +109,14 @@ If you skipped pairing during install:
 whatsapp-agent pair
 ```
 
-A QR code prints in the terminal. Scan it from WhatsApp → **Linked devices**. The session is stored under `~/.agent-whatsapp/whatsapp/session` and survives restarts.
+If credentials already exist, the command asks whether to use the existing session, pair again with a fresh QR, or cancel.
+
+```bash
+whatsapp-agent pair --reuse        # verify existing credentials
+whatsapp-agent pair --reset --yes  # back up old credentials and force a fresh QR
+```
+
+A QR code prints only when a fresh pairing is needed. Scan it from WhatsApp → **Linked devices**. The session is stored under `~/.agent-whatsapp/whatsapp/session` and survives restarts.
 
 ## CLI reference
 
@@ -117,7 +124,8 @@ A QR code prints in the terminal. Scan it from WhatsApp → **Linked devices**. 
 whatsapp-agent install [--reconfigure] [--non-interactive]
                                     # interactive setup; --reconfigure re-runs
                                     # prompts using saved .env as defaults
-whatsapp-agent pair                 # re-pair WhatsApp (prints QR)
+whatsapp-agent pair [--reuse|--reset] [--yes]
+                                    # pair, verify, or replace WhatsApp credentials
 whatsapp-agent run                  # foreground gateway (no systemd; macOS too)
 whatsapp-agent service start        # systemd user service controls
 whatsapp-agent service stop

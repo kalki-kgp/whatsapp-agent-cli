@@ -135,7 +135,14 @@ def cmd_pair(args: argparse.Namespace) -> int:
             _warn("Run `whatsapp-agent install --reconfigure` to rebuild the runtime.")
             return 1
         _ok("runtime files repaired")
-    return _exec_bash(script, [], env={"AGENT_WHATSAPP_HOME": str(install_dir)})
+    forwarded: list[str] = []
+    if args.reuse:
+        forwarded.append("--reuse")
+    if args.reset:
+        forwarded.append("--reset")
+    if args.yes:
+        forwarded.append("--yes")
+    return _exec_bash(script, forwarded, env={"AGENT_WHATSAPP_HOME": str(install_dir)})
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -343,7 +350,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_install.add_argument("--service", default=None, help="systemd user service name.")
     p_install.set_defaults(func=cmd_install)
 
-    p_pair = sub.add_parser("pair", help="Re-pair WhatsApp (prints QR in the terminal).")
+    p_pair = sub.add_parser("pair", help="Pair or verify the WhatsApp session.")
+    pair_mode = p_pair.add_mutually_exclusive_group()
+    pair_mode.add_argument("--reuse", action="store_true",
+                           help="Use existing WhatsApp credentials and verify they connect.")
+    pair_mode.add_argument("--reset", "--new", action="store_true",
+                           help="Back up existing credentials and show a fresh QR code.")
+    p_pair.add_argument("-y", "--yes", action="store_true",
+                        help="Do not prompt when --reset is selected.")
     p_pair.set_defaults(func=cmd_pair)
 
     p_run = sub.add_parser("run", help="Run the gateway in the foreground (no systemd).")
