@@ -159,9 +159,9 @@ Send these as WhatsApp messages from any allowed number:
 | `/title <name>` | Name the current session; this is the session name shown by `/resume` |
 | `/root /abs/path` | Change the working directory for this chat |
 | `/model <name>` | Change the model for future turns without clearing the session |
-| `/compact` | Write a carry-forward summary while keeping the same session id |
+| `/compact` | Write a carry-forward summary and start a fresh backend session |
 | `/memory` | Show this chat's long-term memory index and session ids |
-| `/memory update` | Update memory files and compact the active session in place |
+| `/memory update` | Update memory files and compact into a fresh backend session |
 | `/yes` | Approve a pending gateway action, such as a package upgrade |
 | `/no` | Dismiss a pending gateway action |
 | `/help` | Show all chat commands and quick usage notes |
@@ -193,6 +193,7 @@ Settings live in `~/.agent-whatsapp/.env`. Edit by hand or re-run `whatsapp-agen
 | `AGENT_WHISPER_LANGUAGE` | Optional language code; blank lets Whisper auto-detect |
 | `AGENT_WHISPER_BEAM_SIZE` | Beam size for transcription, default `5` |
 | `AGENT_UPGRADE_CHECK` | Set to `0` to disable PyPI upgrade notices |
+| `AGENT_UPGRADE_CHECK_RETRY_INTERVAL` | Seconds between retry checks while no newer version is found, default `60` |
 | `AGENT_PACKAGE_VERSION` | Installed package version used for upgrade notices |
 | `SERVICE_NAME` | systemd user service name used by approved upgrades |
 
@@ -212,7 +213,7 @@ If you enable voice transcription during install, the runtime venv installs `fas
 
 ## Long-Term Memory
 
-Memory is enabled by default. At `AGENT_MEMORY_ROLLOVER_TIME` each day, the gateway finds active chats whose current session started before that time, asks the live agent session to update long-term memory files and write a carry-forward summary, and keeps the same session id active with that summary preloaded.
+Memory is enabled by default. At `AGENT_MEMORY_ROLLOVER_TIME` each day, the gateway finds active chats whose current session started before that time, asks the live agent session to update long-term memory files and write a carry-forward summary, then starts the next message in a fresh backend session with that summary preloaded.
 
 Each chat gets its own folder under `AGENT_MEMORY_DIR`:
 
@@ -227,7 +228,7 @@ memory/<chat-id-hash>/
   sessions/
 ```
 
-`MEMORY.md` is the index. Topic files hold the details, and `sessions/` stores daily rollover records with the compacted session id. Send `/memory` to see the paths and active/previous session ids, or `/memory update` to force the memory update and in-place compaction immediately.
+`MEMORY.md` is the index. Topic files hold the details, and `sessions/` stores daily rollover records with the compacted session id. Send `/memory` to see the paths and active/previous session ids, or `/memory update` to force the memory update and summary handoff immediately.
 
 ## Troubleshooting
 

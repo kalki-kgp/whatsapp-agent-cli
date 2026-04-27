@@ -328,6 +328,34 @@ def _state_lines(install_dir: Path, env: dict[str, str]) -> list[str]:
     return lines
 
 
+def _message_history_lines(install_dir: Path, limit: int = 60) -> list[str]:
+    state_path = install_dir / "state.json"
+    if not state_path.exists():
+        return ["No message history yet. New WhatsApp messages will appear here."]
+    try:
+        state = json.loads(state_path.read_text())
+    except Exception as exc:
+        return [f"Could not read message history: {exc}"]
+
+    history = state.get("message_history") or []
+    if not history:
+        return ["No message history yet. New WhatsApp messages will appear here."]
+
+    chats = state.get("chats") or {}
+    lines: list[str] = []
+    for entry in history[-limit:]:
+        chat_id = str(entry.get("chat_id") or "")
+        chat_state = chats.get(chat_id) or {}
+        chat_label = chat_state.get("title") or chat_id.replace("@s.whatsapp.net", "")
+        at = str(entry.get("at") or "")
+        clock = at[11:16] if len(at) >= 16 else "--:--"
+        direction = "IN " if entry.get("direction") == "in" else "OUT"
+        sender = entry.get("sender") or ("agent" if direction == "OUT" else "(unknown)")
+        text = " ".join(str(entry.get("text") or "").split())
+        lines.append(f"{clock} {direction} {chat_label} | {sender}: {text}")
+    return lines
+
+
 def _draw_line(stdscr: object, y: int, x: int, text: str, width: int, attr: int = 0) -> None:
     safe = text.replace("\t", "    ")
     try:
@@ -349,7 +377,7 @@ def _run_monitor(proc: subprocess.Popen, install_dir: Path, env: dict[str, str],
         curses.curs_set(0)
         stdscr.nodelay(True)
         stdscr.timeout(250)
-        selected = "gateway"
+        selected = "messages"
         while True:
             key = stdscr.getch()
             if key in {ord("q"), ord("Q"), 3}:
@@ -365,13 +393,22 @@ def _run_monitor(proc: subprocess.Popen, install_dir: Path, env: dict[str, str],
                 selected = "gateway"
             if key in {ord("b"), ord("B")}:
                 selected = "bridge"
+            if key in {ord("m"), ord("M")}:
+                selected = "messages"
 
             height, width = stdscr.getmaxyx()
             stdscr.erase()
             running = proc.poll() is None
             title = "whatsapp-agent run"
             status = "running" if running else f"exited {proc.returncode}"
-            _draw_line(stdscr, 0, 0, f" {title} [{status}]  q:quit  g:gateway  b:bridge", width, curses.A_REVERSE)
+            _draw_line(
+                stdscr,
+                0,
+                0,
+                f" {title} [{status}]  q:quit  m:messages  g:gateway  b:bridge",
+                width,
+                curses.A_REVERSE,
+            )
 
             left_width = min(46, max(28, width // 3))
             log_width = max(20, width - left_width - 3)
@@ -382,9 +419,27 @@ def _run_monitor(proc: subprocess.Popen, install_dir: Path, env: dict[str, str],
             for y in range(1, height):
                 _draw_line(stdscr, y, left_width + 1, "|", 2)
 
-            log_path = gateway_log if selected == "gateway" else bridge_log
-            _draw_line(stdscr, 2, left_width + 3, f"{selected} log: {log_path}", log_width, curses.A_BOLD)
-            log_lines = _tail_lines(log_path, max(5, height - 5))
+            if selected == "messages":
+                _draw_line(
+                    stdscr,
+                    2,
+                    left_width + 3,
+                    "messages: recent WhatsApp activity",
+                    log_width,
+                    curses.A_BOLD,
+                )
+                log_lines = _message_history_lines(install_dir, max(5, height - 5))
+            else:
+                log_path = gateway_log if selected == "gateway" else bridge_log
+                _draw_line(
+                    stdscr,
+                    2,
+                    left_width + 3,
+                    f"{selected} log: {log_path}",
+                    log_width,
+                    curses.A_BOLD,
+                )
+                log_lines = _tail_lines(log_path, max(5, height - 5))
             start_y = 3
             for idx, line in enumerate(log_lines[-(height - start_y - 1):]):
                 _draw_line(stdscr, start_y + idx, left_width + 3, line, log_width)

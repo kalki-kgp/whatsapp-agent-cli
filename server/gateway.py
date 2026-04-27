@@ -146,10 +146,14 @@ class Config:
         self.logs_dir = self.home / "logs"
         self.bridge_log = self.logs_dir / "bridge.log"
         self.processed_limit = int(os.getenv("CW_PROCESSED_LIMIT", "2000"))
+        self.message_history_limit = int(os.getenv("CW_MESSAGE_HISTORY_LIMIT", "100"))
         self.typing_interval = float(os.getenv("CW_TYPING_INTERVAL", "8"))
         self.package_version = _env_first("AGENT_PACKAGE_VERSION", default="")
         self.upgrade_check = _env_flag("AGENT_UPGRADE_CHECK", default=True)
         self.upgrade_check_interval = float(os.getenv("AGENT_UPGRADE_CHECK_INTERVAL", "3600"))
+        self.upgrade_check_retry_interval = float(
+            os.getenv("AGENT_UPGRADE_CHECK_RETRY_INTERVAL", "60")
+        )
         self.service_name = _env_first("SERVICE_NAME", default="agent-whatsapp")
         self.memory_enabled = _env_flag("AGENT_MEMORY_ENABLED", default=True)
         self.memory_dir = Path(
@@ -211,6 +215,33 @@ class StateStore:
     def has_processed(self, message_id: str) -> bool:
         ids = self.data.setdefault("processed_ids", [])
         return message_id in ids
+
+    def record_message(
+        self,
+        chat_id: str,
+        *,
+        direction: str,
+        sender: str,
+        text: str,
+        media_type: str = "",
+        limit: int = 100,
+    ) -> None:
+        cleaned = " ".join((text or "").strip().split())
+        if not cleaned:
+            cleaned = f"[{media_type or 'message'}]"
+        history: list[dict[str, str]] = self.data.setdefault("message_history", [])
+        history.append(
+            {
+                "at": now_iso(),
+                "chat_id": chat_id,
+                "direction": direction,
+                "sender": sender or "(unknown)",
+                "media_type": media_type or "text",
+                "text": cleaned[:2000],
+            }
+        )
+        if len(history) > limit:
+            del history[:-limit]
 
 
 def split_message(text: str, limit: int) -> list[str]:
@@ -391,6 +422,7 @@ def archive_snapshot(chat_state: dict[str, Any], *, force: bool = False) -> bool
     snapshot = {
         "name": title,
         "thread_id": thread_id,
+        "backend": (chat_state.get("backend") or "").strip(),
         "root": root,
         "model": model,
         "summary": summary,
@@ -431,20 +463,28 @@ def format_saved_sessions(chat_state: dict[str, Any]) -> str:
     if active_id or active_title or active_summary:
         name = active_title or "(untitled)"
         thread_id = active_id or "(no id yet)"
+        backend = chat_state.get("backend") or "(current)"
         model = chat_state.get("model") or "(default)"
         root = chat_state.get("root") or "(root unset)"
         started = str(chat_state.get("session_started_at") or "")[:16].replace("T", " ")
         suffix = f" | started={started}" if started else ""
-        lines.append(f"- current: {name} | id={thread_id} | model={model} | root={root}{suffix}")
+        lines.append(
+            f"- current: {name} | id={thread_id} | backend={backend} | "
+            f"model={model} | root={root}{suffix}"
+        )
     for entry in saved:
         if active_id and entry.get("thread_id") == active_id:
             continue
         name = entry.get("name") or "(untitled)"
         thread_id = entry.get("thread_id") or "(no id)"
+        backend = entry.get("backend") or "(unknown)"
         model = entry.get("model") or "(default)"
         root = entry.get("root") or "(root unset)"
         saved_at = entry.get("saved_at", "")[:16].replace("T", " ")
-        lines.append(f"- {name} | id={thread_id} | model={model} | root={root} | {saved_at}")
+        lines.append(
+            f"- {name} | id={thread_id} | backend={backend} | "
+            f"model={model} | root={root} | {saved_at}"
+        )
     lines.append("Use `/resume <name>` or `/resume <id>` to switch back.")
     lines.append("Use `/search-session <query>` or `/ss <query>` when you only remember part of the work.")
     return "\n".join(lines)
@@ -471,6 +511,7 @@ def session_search_blob(entry: dict[str, Any]) -> str:
     fields = [
         entry.get("name") or "",
         entry.get("thread_id") or "",
+        entry.get("backend") or "",
         entry.get("root") or "",
         entry.get("model") or "",
         entry.get("summary") or "",
@@ -544,7 +585,7 @@ def format_chat_help() -> str:
         "/model <name> - change the model for future turns without clearing this session\n"
         "/model - show the current model\n\n"
         "Memory\n"
-        "/compact - write a carry-forward summary while keeping the same session id\n"
+        "/compact - write a carry-forward summary and start a fresh backend session\n"
         "/memory - show this chat's memory files and rollover state\n"
         "/memory update - update memory files and compact this session now\n\n"
         "Approvals\n"
@@ -718,6 +759,14 @@ class WhatsAppAgentGateway:
     async def process_message(self, event: dict[str, Any]) -> None:
         chat_id = str(event["chatId"])
         body = (event.get("body") or "").strip()
+        self.state.record_message(
+            chat_id,
+            direction="in",
+            sender=str(event.get("senderName") or event.get("senderId") or "(unknown)"),
+            text=body,
+            media_type=str(event.get("mediaType") or "text"),
+            limit=self.config.message_history_limit,
+        )
         LOG.info(
             "Incoming message chat=%s sender=%s media=%s body=%s",
             chat_id,
@@ -742,9 +791,11 @@ class WhatsAppAgentGateway:
 
         if thread_id and chat_state.get("thread_id") != thread_id:
             chat_state["thread_id"] = thread_id
+            chat_state["backend"] = self.config.backend
             chat_state.setdefault("session_started_at", now_iso())
             self.state.save()
         elif thread_id and not chat_state.get("session_started_at"):
+            chat_state["backend"] = self.config.backend
             chat_state["session_started_at"] = now_iso()
             self.state.save()
 
@@ -863,7 +914,12 @@ class WhatsAppAgentGateway:
         if not self.config.upgrade_check or not self.config.package_version:
             return
         now = time.monotonic()
-        if now - self.last_upgrade_check < self.config.upgrade_check_interval:
+        interval = (
+            self.config.upgrade_check_interval
+            if is_newer_version(self.latest_package_version, self.config.package_version)
+            else self.config.upgrade_check_retry_interval
+        )
+        if now - self.last_upgrade_check < interval:
             return
         self.last_upgrade_check = now
 
@@ -882,6 +938,11 @@ class WhatsAppAgentGateway:
             return
 
         self.latest_package_version = latest
+        LOG.info(
+            "Checked whatsapp-agent-cli version current=%s latest=%s",
+            self.config.package_version,
+            latest or "(unknown)",
+        )
         if is_newer_version(latest, self.config.package_version):
             self.upgrade_notice = (
                 f"Upgrade available: whatsapp-agent-cli {self.config.package_version} -> {latest}.\n"
@@ -997,8 +1058,8 @@ class WhatsAppAgentGateway:
         files = "\n".join(f"- {memory_dir / filename}" for filename in self.config.memory_files)
         return (
             "Scheduled daily memory rollover for this WhatsApp agent session.\n"
-            "You are currently inside the live session that is being compacted in place.\n"
-            "After this, the gateway will keep the same session id and continue with the updated carry-forward summary.\n"
+            "You are currently inside the live session that is being summarized before handoff.\n"
+            "After this, the gateway will start the next message in a fresh backend session with the updated carry-forward summary.\n"
             "\n"
             f"WhatsApp chat id: {chat_id}\n"
             f"Current session id: {session_id or '(none)'}\n"
@@ -1106,9 +1167,13 @@ class WhatsAppAgentGateway:
         if thread_id and not session_id:
             session_id = thread_id
             chat_state["thread_id"] = thread_id
+            chat_state["backend"] = self.config.backend
         self.write_memory_session_record(chat_id, chat_state, session_id, session_file, reply)
         chat_state["summary"] = build_carry_forward_summary(reply, session_id, session_file)
         archive_snapshot(chat_state, force=True)
+        chat_state.pop("thread_id", None)
+        chat_state.pop("session_started_at", None)
+        chat_state["backend"] = self.config.backend
         chat_state["last_memory_rollover_date"] = local_now().date().isoformat()
         chat_state["last_memory_rollover_at"] = now_iso()
         chat_state["last_memory_session_id"] = session_id
@@ -1119,8 +1184,14 @@ class WhatsAppAgentGateway:
     def restore_saved_session(
         self, chat_state: dict[str, Any], target: dict[str, Any]
     ) -> None:
-        chat_state["thread_id"] = target.get("thread_id") or ""
-        chat_state["session_started_at"] = target.get("session_started_at") or now_iso()
+        target_backend = str(target.get("backend") or self.config.backend).strip().lower()
+        chat_state["backend"] = target_backend
+        if target_backend == self.config.backend:
+            chat_state["thread_id"] = target.get("thread_id") or ""
+            chat_state["session_started_at"] = target.get("session_started_at") or now_iso()
+        else:
+            chat_state.pop("thread_id", None)
+            chat_state.pop("session_started_at", None)
         chat_state["root"] = target.get("root") or chat_state.get("root", self.state.default_root)
         if target.get("model"):
             chat_state["model"] = target.get("model")
@@ -1212,7 +1283,8 @@ class WhatsAppAgentGateway:
             self.state.save()
             await self.send_message(
                 chat_id,
-                "Context compacted into a carry-forward summary for this same session.\n\n"
+                "Context compacted into a carry-forward summary. The next message will start "
+                "a fresh backend session with this summary.\n\n"
                 + summary,
             )
             return True
@@ -1309,7 +1381,7 @@ class WhatsAppAgentGateway:
                     await self.stop_typing(chat_id)
                 await self.send_message(
                     chat_id,
-                    "Memory updated. This same session will continue with the carry-forward summary.\n\n"
+                    "Memory updated. The next message will start a fresh backend session with the carry-forward summary.\n\n"
                     + reply,
                 )
                 return True
@@ -1342,7 +1414,7 @@ class WhatsAppAgentGateway:
                 await self.stop_typing(chat_id)
             await self.send_message(
                 chat_id,
-                "Memory updated. This same session will continue with the carry-forward summary.\n\n"
+                "Memory updated. The next message will start a fresh backend session with the carry-forward summary.\n\n"
                 + reply,
             )
             return True
@@ -1392,9 +1464,11 @@ class WhatsAppAgentGateway:
 
         if thread_id and chat_state.get("thread_id") != thread_id:
             chat_state["thread_id"] = thread_id
+            chat_state["backend"] = self.config.backend
             chat_state.setdefault("session_started_at", now_iso())
             self.state.save()
         elif thread_id and not chat_state.get("session_started_at"):
+            chat_state["backend"] = self.config.backend
             chat_state["session_started_at"] = now_iso()
             self.state.save()
 
@@ -1425,7 +1499,19 @@ class WhatsAppAgentGateway:
         summary, _ = await self.run_agent(fake_event, chat_state, root, prompt_override=prompt)
         chat_state["summary"] = summary.strip()
         archive_snapshot(chat_state, force=True)
+        chat_state.pop("thread_id", None)
+        chat_state.pop("session_started_at", None)
+        chat_state["backend"] = self.config.backend
         return summary.strip(), None
+
+    def ensure_backend_context(self, chat_state: dict[str, Any]) -> None:
+        current_backend = self.config.backend
+        stored_backend = str(chat_state.get("backend") or "").strip().lower()
+        if stored_backend and stored_backend != current_backend and chat_state.get("thread_id"):
+            archive_snapshot(chat_state)
+            chat_state.pop("thread_id", None)
+            chat_state.pop("session_started_at", None)
+        chat_state["backend"] = current_backend
 
     async def run_agent(
         self,
@@ -1435,6 +1521,7 @@ class WhatsAppAgentGateway:
         *,
         prompt_override: str | None = None,
     ) -> tuple[str, str | None]:
+        self.ensure_backend_context(chat_state)
         if self.config.backend == "claude":
             return await self.run_claude(event, chat_state, root, prompt_override=prompt_override)
         return await self.run_codex(event, chat_state, root, prompt_override=prompt_override)
@@ -1611,6 +1698,14 @@ class WhatsAppAgentGateway:
                     timeout=aiohttp.ClientTimeout(total=30),
                 ) as resp:
                     if resp.status == 200:
+                        self.state.record_message(
+                            chat_id,
+                            direction="out",
+                            sender="agent",
+                            text=message,
+                            limit=self.config.message_history_limit,
+                        )
+                        self.state.save()
                         return
                     detail = await resp.text()
                     last_error = f"Bridge send failed: {resp.status} {detail}"
