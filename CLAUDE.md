@@ -84,11 +84,26 @@ The gateway uses per-chat `asyncio.Lock` to serialize concurrent messages from t
 
 ## Backend invocation details
 
-**Codex** (`run_codex`): calls `codex exec [resume --json | --json --skip-git-repo-check] --dangerously-bypass-approvals-and-sandbox -o <tmpfile>`. Reply is read from the tmpfile; `thread_id` is extracted from `thread.started` JSON events on stdout.
+The two backends use very different shapes — Codex runs as a per-message subprocess; Claude runs as a single long-lived channel-driven session.
 
-**Claude** (`run_claude`): calls `claude -p --output-format json --permission-mode bypassPermissions --add-dir <root> [--resume | --session-id]`. Reply and `session_id` come from the JSON payload on stdout.
+**Codex** (`run_codex`): calls `codex exec [resume --json | --json --skip-git-repo-check] --dangerously-bypass-approvals-and-sandbox -o <tmpfile>`. Reply is read from the tmpfile; `thread_id` is extracted from `thread.started` JSON events on stdout. Auto-retries once with a cleared `thread_id` if the session is not found.
 
-Both backends auto-retry once with a cleared `thread_id` if the backend reports the session was not found.
+**Claude beta** (channel supervisor): when `AGENT_BACKEND=claude`, `_main` skips the gateway loop and runs `ChannelSupervisor` (`server/channel_supervisor.py`) instead. The supervisor:
+
+1. On startup, idempotently runs `claude plugin marketplace add <plugin_dir>/..`, `claude plugin marketplace update whatsapp-agent-cli`, `claude plugin install whatsapp@whatsapp-agent-cli`, and `claude plugin update whatsapp@whatsapp-agent-cli`. The marketplace name is read from `plugins/.claude-plugin/marketplace.json`.
+2. Spawns `claude --dangerously-load-development-channels plugin:whatsapp@whatsapp-agent-cli --add-dir <root> --permission-mode bypassPermissions` **under a PTY** — Claude treats non-TTY stdout as `--print` mode and refuses to launch without a prompt, so we use `pty.openpty()` and stream the output to `claude-channel.log` via a reader thread.
+3. After spawn, an async task writes `\r` to the PTY three times (1.5s apart) to dismiss two first-run gates: workspace trust ("Yes, I trust this folder") and dev-channels consent ("I am using this for local development"). Both have the safe option as default 1, so pressing Enter advances them.
+4. Restarts claude on crash with exponential backoff; sends SIGTERM on shutdown.
+
+WhatsApp ↔ Claude messaging runs entirely through the plugin in `plugins/whatsapp/` (a Bun MCP server) — `bridge/bridge.js` is not started in this mode. As of v0.2, the plugin owns Baileys QR pairing, inbound text channel notifications, and text replies. The channel is wired by `--dangerously-load-development-channels` because the plugin isn't on Anthropic's allowlist; this is fine during the channels research preview but needs to change for distribution. Billing flows through the interactive subscription pool, not the Agent SDK pool that `claude -p` now uses.
+
+The Claude path is intentionally beta and does not use per-chat `thread_id`, `--resume`, or `--session-id` — there is one session per server, and chat-level state lives inside the plugin. Codex keeps the mature gateway feature set; Claude features should be added to the channel plugin one by one instead of blindly porting gateway behavior.
+
+Env vars specific to the Claude path:
+- `CLAUDE_BIN` — path to the claude binary (default: `claude` on PATH).
+- `CLAUDE_PLUGIN_DIR` — absolute path to the plugin directory (default: `<home>/plugins/whatsapp`). Its parent must contain `.claude-plugin/marketplace.json`.
+- `CLAUDE_CHANNEL_SPEC` — the channel spec (default: `plugin:whatsapp@whatsapp-agent-cli`).
+- `CLAUDE_CHANNEL_EXTRA_ARGS` — extra args appended to the claude command (shell-split).
 
 ## Allowlist / identity matching
 

@@ -52,6 +52,8 @@ Env vars consumed in --non-interactive mode (or as defaults):
   AGENT_BACKEND          codex | claude
   AGENT_COMMAND          path to the CLI binary
   AGENT_MODEL            model name (blank = CLI default)
+  CLAUDE_PLUGIN_DIR      Claude beta channel plugin dir
+  CLAUDE_CHANNEL_SPEC    Claude beta channel spec
   AGENT_MEMORY_DIR       memory root (default INSTALL_DIR/memory)
   AGENT_MEMORY_ENABLED   1/0 toggle for long-term memory
   AGENT_MEMORY_ROLLOVER_TIME
@@ -419,6 +421,9 @@ install_python_deps() {
 }
 
 install_node_deps() {
+  if [[ "$BACKEND" == "claude" ]]; then
+    return 0
+  fi
   ( cd "$INSTALL_DIR/bridge" && npm install )
 }
 
@@ -448,6 +453,17 @@ CW_LOG_LEVEL=INFO
 CW_SEND_RETRY_SECONDS=60
 CW_SEND_RETRY_INTERVAL=2
 EOF
+  if [[ "$BACKEND" == "claude" ]]; then
+    # Default operator = first comma-separated entry of WHATSAPP_ALLOWED_USERS,
+    # so the Claude beta auto-seeds the operator allowlist entry on pair and
+    # doesn't make the user run an "add me to allowlist" prompt manually.
+    local operator_default="${WHATSAPP_OPERATOR_USERS:-${ALLOWED_USERS%%,*}}"
+    cat >> "$INSTALL_DIR/.env" <<EOF
+CLAUDE_PLUGIN_DIR=${CLAUDE_PLUGIN_DIR:-$INSTALL_DIR/plugins/whatsapp}
+CLAUDE_CHANNEL_SPEC=${CLAUDE_CHANNEL_SPEC:-plugin:whatsapp@whatsapp-agent-cli}
+WHATSAPP_OPERATOR_USERS=$operator_default
+EOF
+  fi
   chmod 600 "$INSTALL_DIR/.env"
 }
 
@@ -556,14 +572,16 @@ main() {
   else                              note "claude    ${DIM}not found${RESET}"; fi
   if [[ -n "$codex_path" ]];  then ok "codex     ${DIM}$codex_path${RESET}"
   else                              note "codex     ${DIM}not found${RESET}"; fi
+  if command -v bun >/dev/null 2>&1; then ok "bun       ${DIM}$(command -v bun)${RESET}"
+  else                                   note "bun       ${DIM}not found; needed only for Claude beta${RESET}"; fi
 
   # ── backend ───────────────────────────────────────────────────────────────
   BACKEND="${AGENT_BACKEND:-}"
   if [[ -z "$BACKEND" ]]; then
     if [[ -n "$claude_path" && -n "$codex_path" ]]; then
       menu_select "Which CLI should answer messages?" \
-        "Both detected. Pick one — you can change later with --reconfigure." \
-        1 "claude" "codex"
+        "Both detected. Codex is stable; Claude is a channels beta." \
+        1 "codex" "claude"
       BACKEND="$MENU_RESULT"
     elif [[ -n "$claude_path" ]]; then
       BACKEND="claude"
@@ -576,6 +594,16 @@ main() {
       note "Install one first, then re-run this script."
       note "  claude:  https://docs.anthropic.com/claude/cli"
       note "  codex:   https://github.com/openai/codex"
+      exit 1
+    fi
+  fi
+
+  if [[ "$BACKEND" == "claude" ]]; then
+    warn "Claude backend is beta: it uses Claude Code channels, not the mature per-chat gateway."
+    note "Codex commands like /root, /resume, /model, memory, media, and voice notes remain Codex-first until the WhatsApp channel plugin catches up."
+    if ! command -v bun >/dev/null 2>&1; then
+      fail "Bun is required for Claude beta."
+      note "Install it from https://bun.sh, then re-run this installer."
       exit 1
     fi
   fi
@@ -683,7 +711,11 @@ main() {
   fi
   run_step "ensuring uv is available"        ensure_uv
   run_step "creating python venv + deps"     install_python_deps
-  run_step "installing node bridge deps"     install_node_deps
+  if [[ "$BACKEND" == "claude" ]]; then
+    note "Claude beta skips bridge.js deps; the Bun channel plugin owns WhatsApp transport."
+  else
+    run_step "installing node bridge deps"   install_node_deps
+  fi
   if [[ -z "$PACKAGE_VERSION" ]]; then
     PACKAGE_VERSION="$(detect_package_version || true)"
   fi
@@ -692,7 +724,7 @@ main() {
 
   # ── pair (optional) ───────────────────────────────────────────────────────
   local paired=0
-  if [[ $INTERACTIVE -eq 1 ]]; then
+  if [[ $INTERACTIVE -eq 1 && "$BACKEND" != "claude" ]]; then
     if confirm "Pair WhatsApp now?" \
         "Prints a QR code in this terminal. Scan with WhatsApp → Linked devices." \
         "y"; then
@@ -702,6 +734,8 @@ main() {
       fi
       paired=1
     fi
+  elif [[ "$BACKEND" == "claude" ]]; then
+    note "Claude beta pairing is handled by the WhatsApp channel plugin, not whatsapp-agent pair."
   fi
 
   print_finished "$paired"

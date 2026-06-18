@@ -14,9 +14,10 @@ from collections import deque
 from datetime import UTC, datetime, time as datetime_time
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
 
 import aiohttp
+
+from channel_supervisor import ChannelSupervisor
 
 
 LOG = logging.getLogger("codex_whatsapp")
@@ -142,6 +143,14 @@ class Config:
         self.send_retry_interval = float(os.getenv("CW_SEND_RETRY_INTERVAL", "2"))
         self.logs_dir = self.home / "logs"
         self.bridge_log = self.logs_dir / "bridge.log"
+        self.claude_channel_log = self.logs_dir / "claude-channel.log"
+        self.claude_plugin_dir = Path(
+            _env_first("CLAUDE_PLUGIN_DIR", default=str(self.home / "plugins" / "whatsapp"))
+        ).expanduser()
+        self.claude_channel_spec = _env_first(
+            "CLAUDE_CHANNEL_SPEC", default="plugin:whatsapp@whatsapp-agent-cli"
+        )
+        self.claude_channel_extra_args = shlex.split(os.getenv("CLAUDE_CHANNEL_EXTRA_ARGS", ""))
         self.processed_limit = int(os.getenv("CW_PROCESSED_LIMIT", "2000"))
         self.message_history_limit = int(os.getenv("CW_MESSAGE_HISTORY_LIMIT", "100"))
         self.typing_interval = float(os.getenv("CW_TYPING_INTERVAL", "8"))
@@ -636,6 +645,11 @@ class WhatsAppAgentGateway:
             self.upgrade_task = asyncio.create_task(self.upgrade_notice_loop())
         if self.config.memory_enabled:
             self.memory_task = asyncio.create_task(self.memory_rollover_loop())
+        if self.config.transcribe_audio:
+            # Pre-load faster-whisper in a background thread so the first
+            # voice note doesn't pay the model-init cost. The model object
+            # is cached on self and reused by transcribe_audio_file.
+            asyncio.create_task(asyncio.to_thread(self._warm_whisper_sync))
         try:
             await self.poll_loop()
         finally:
@@ -855,6 +869,39 @@ class WhatsAppAgentGateway:
     async def transcribe_audio_file(self, path: Path) -> str:
         async with self.whisper_lock:
             return await asyncio.to_thread(self._transcribe_audio_file_sync, path)
+
+    def _warm_whisper_sync(self) -> None:
+        """Initialise the faster-whisper model before the first voice note.
+
+        Runs in a worker thread. Any exception is logged and swallowed so the
+        gateway keeps polling; the first real transcription will surface a
+        useful error if the model never loaded.
+        """
+        try:
+            from faster_whisper import WhisperModel
+        except ImportError:
+            LOG.info(
+                "faster-whisper not installed; skipping warm. Voice notes will "
+                "report transcription as unavailable until the package is added."
+            )
+            return
+        if self.whisper_model is not None:
+            return
+        LOG.info(
+            "Warming faster-whisper model=%s device=%s compute_type=%s",
+            self.config.whisper_model,
+            self.config.whisper_device,
+            self.config.whisper_compute_type,
+        )
+        try:
+            self.whisper_model = WhisperModel(
+                self.config.whisper_model,
+                device=self.config.whisper_device,
+                compute_type=self.config.whisper_compute_type,
+            )
+            LOG.info("faster-whisper warm: ready")
+        except Exception:
+            LOG.exception("faster-whisper warm failed")
 
     def _transcribe_audio_file_sync(self, path: Path) -> str:
         try:
@@ -1612,7 +1659,10 @@ class WhatsAppAgentGateway:
     ) -> tuple[str, str | None]:
         self.ensure_backend_context(chat_state)
         if self.config.backend == "claude":
-            return await self.run_claude(event, chat_state, root, prompt_override=prompt_override)
+            raise RuntimeError(
+                "Claude backend runs via channel supervisor, not the gateway loop. "
+                "This code path should not be reached."
+            )
         return await self.run_codex(event, chat_state, root, prompt_override=prompt_override)
 
     async def run_codex(
@@ -1692,87 +1742,6 @@ class WhatsAppAgentGateway:
 
         return reply or "Done.", thread_id
 
-    async def run_claude(
-        self,
-        event: dict[str, Any],
-        chat_state: dict[str, Any],
-        root: str,
-        *,
-        prompt_override: str | None = None,
-    ) -> tuple[str, str | None]:
-        prompt, _ = build_prompt(event, root)
-        if prompt_override is not None:
-            prompt = prompt_override
-        summary = (chat_state.get("summary") or "").strip()
-        title = (chat_state.get("title") or "").strip()
-        if summary and prompt_override is None:
-            prompt = (
-                f"Carried session summary:\n{summary}\n\n"
-                + (f"Session title: {title}\n\n" if title else "")
-                + prompt
-            )
-        if prompt_override is None and self.config.memory_enabled:
-            memory_context = self.build_memory_context(str(event["chatId"]), chat_state)
-            if memory_context:
-                prompt = memory_context + "\n" + prompt
-
-        existing_thread = (chat_state.get("thread_id") or "").strip()
-        thread_id = existing_thread or str(uuid4())
-        args = [
-            self.config.agent_command,
-            "-p",
-            "--output-format",
-            "json",
-            "--permission-mode",
-            "bypassPermissions",
-            "--add-dir",
-            str(root),
-        ]
-        if self.config.memory_enabled:
-            memory_dir = self.memory_dir_for_chat(str(event["chatId"]))
-            if str(memory_dir) != str(root):
-                args.extend(["--add-dir", str(memory_dir)])
-        if existing_thread:
-            args.extend(["--resume", existing_thread])
-        else:
-            args.extend(["--session-id", thread_id])
-
-        selected_model = (chat_state.get("model") or self.config.model).strip()
-        if selected_model:
-            args.extend(["--model", selected_model])
-        args.append(prompt)
-
-        LOG.info("Running Claude for chat %s: %s", event["chatId"], shlex.join(args[:-1]) + " <prompt>")
-        proc = await asyncio.create_subprocess_exec(
-            *args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=os.environ.copy(),
-        )
-        stdout, stderr = await proc.communicate()
-        stdout_text = stdout.decode("utf-8", errors="replace").strip()
-        stderr_text = stderr.decode("utf-8", errors="replace").strip()
-
-        try:
-            payload = json.loads(stdout_text) if stdout_text else {}
-        except json.JSONDecodeError:
-            payload = {}
-
-        if payload.get("session_id"):
-            thread_id = str(payload["session_id"])
-
-        reply = str(payload.get("result") or "").strip()
-        is_error = bool(payload.get("is_error"))
-        if proc.returncode != 0 or is_error:
-            combined = "\n".join(part for part in [stderr_text, stdout_text] if part).lower()
-            if existing_thread and "session" in combined and "not found" in combined:
-                chat_state.pop("thread_id", None)
-                return await self.run_claude(event, chat_state, root, prompt_override=prompt_override)
-            detail = stderr_text or stdout_text or "Claude exited with an unknown error."
-            reply = reply or f"Claude failed:\n{detail[:1500]}"
-
-        return reply or "Done.", thread_id
-
     async def send_message(self, chat_id: str, message: str) -> None:
         assert self.http is not None
         url = f"http://127.0.0.1:{self.config.bridge_port}/send"
@@ -1849,13 +1818,43 @@ class WhatsAppAgentGateway:
         await proc.wait()
 
 
+async def _run_claude_channel(config: Config) -> None:
+    config.ensure_dirs()
+    supervisor = ChannelSupervisor(
+        claude_bin=config.agent_command,
+        plugin_dir=config.claude_plugin_dir,
+        channel_spec=config.claude_channel_spec,
+        workspace_root=config.default_root,
+        log_path=config.claude_channel_log,
+        model=config.model,
+        memory_dir=config.memory_dir if config.memory_enabled else None,
+        extra_args=config.claude_channel_extra_args,
+    )
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, supervisor.stop_event.set)
+    LOG.info(
+        "Claude channel mode: plugin_dir=%s spec=%s root=%s",
+        supervisor.plugin_dir,
+        supervisor.channel_spec,
+        supervisor.workspace_root,
+    )
+    await supervisor.run()
+
+
 async def _main() -> None:
     load_env_file(Path(_env_first("AGENT_ENV_FILE", "CW_ENV_FILE", default="~/.agent-whatsapp/.env")).expanduser())
     logging.basicConfig(
         level=os.getenv("CW_LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    gateway = WhatsAppAgentGateway(Config())
+    config = Config()
+
+    if config.backend == "claude":
+        await _run_claude_channel(config)
+        return
+
+    gateway = WhatsAppAgentGateway(config)
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, gateway.stop_event.set)

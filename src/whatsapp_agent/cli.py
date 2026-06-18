@@ -498,10 +498,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     py_ok = sys.version_info >= (3, 10)
     check("python ≥ 3.10", py_ok, f"found {sys.version.split()[0]}")
     check("uv on PATH", shutil.which("uv") is not None, shutil.which("uv") or "missing")
-    node = shutil.which("node")
-    check("node on PATH", node is not None, node or "missing")
-
-    install_ok = (install_dir / "bridge" / "bridge.js").exists()
+    install_ok = (install_dir / "server" / "gateway.py").exists()
     check("install dir populated", install_ok, str(install_dir))
 
     env_path = install_dir / ".env"
@@ -511,12 +508,28 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     backend = env.get("AGENT_BACKEND", "")
     check("AGENT_BACKEND set", bool(backend), backend or "(empty)")
 
-    cli_path = env.get("AGENT_COMMAND", "")
-    cli_exists = bool(cli_path) and Path(cli_path).exists()
-    check("CLI binary exists", cli_exists, cli_path or "(empty)")
+    cli_path = (
+        env.get("AGENT_COMMAND")
+        or env.get("CODEX_BIN" if backend == "codex" else "CLAUDE_BIN")
+        or backend
+    )
+    if cli_path and ("/" in cli_path or "\\" in cli_path):
+        cli_exists = Path(cli_path).expanduser().exists()
+        cli_detail = cli_path
+    else:
+        resolved_cli = shutil.which(cli_path) if cli_path else None
+        cli_exists = resolved_cli is not None
+        cli_detail = resolved_cli or cli_path or "(empty)"
+    check("CLI binary exists", cli_exists, cli_detail)
 
     allowed = env.get("WHATSAPP_ALLOWED_USERS", "").strip()
-    check("WHATSAPP_ALLOWED_USERS set", bool(allowed), allowed or "(empty)")
+    if backend == "claude":
+        if allowed:
+            _ok(f"WHATSAPP_ALLOWED_USERS set  {DIM}{allowed}{RESET}")
+        else:
+            _warn("WHATSAPP_ALLOWED_USERS empty; Claude beta access control belongs in the channel plugin.")
+    else:
+        check("WHATSAPP_ALLOWED_USERS set", bool(allowed), allowed or "(empty)")
 
     venv_py = install_dir / ".venv" / "bin" / "python"
     check("python venv built", venv_py.exists(), str(venv_py))
@@ -529,8 +542,21 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         ).returncode == 0
         check("faster-whisper installed", whisper_ok, env.get("AGENT_WHISPER_MODEL", "base"))
 
-    bridge_modules = install_dir / "bridge" / "node_modules"
-    check("bridge node_modules", bridge_modules.exists(), str(bridge_modules))
+    if backend == "claude":
+        bun = shutil.which("bun")
+        check("bun on PATH", bun is not None, bun or "missing")
+        plugin_dir = Path(env.get("CLAUDE_PLUGIN_DIR") or install_dir / "plugins" / "whatsapp").expanduser()
+        check("Claude plugin dir", plugin_dir.exists(), str(plugin_dir))
+        marketplace = plugin_dir.parent / ".claude-plugin" / "marketplace.json"
+        check("Claude marketplace manifest", marketplace.exists(), str(marketplace))
+        channel_spec = env.get("CLAUDE_CHANNEL_SPEC") or "plugin:whatsapp@whatsapp-agent-cli"
+        check("Claude channel spec", bool(channel_spec), channel_spec)
+        _warn("Claude backend is beta: doctor verifies the channel harness, not WhatsApp message flow yet.")
+    else:
+        node = shutil.which("node")
+        check("node on PATH", node is not None, node or "missing")
+        bridge_modules = install_dir / "bridge" / "node_modules"
+        check("bridge node_modules", bridge_modules.exists(), str(bridge_modules))
 
     print()
     if failures == 0:

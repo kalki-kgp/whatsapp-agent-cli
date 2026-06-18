@@ -60,6 +60,7 @@ packages = ["src/whatsapp_agent"]
 "server"           = "whatsapp_agent/_runtime/server"
 "scripts"          = "whatsapp_agent/_runtime/scripts"
 "systemd"          = "whatsapp_agent/_runtime/systemd"
+"plugins"          = "whatsapp_agent/_runtime/plugins"
 "requirements.txt" = "whatsapp_agent/_runtime/requirements.txt"
 
 [tool.hatch.build.targets.sdist]
@@ -69,6 +70,7 @@ include = [
     "server/",
     "scripts/",
     "systemd/",
+    "plugins/",
     "requirements.txt",
     "README.md",
     "LICENSE",

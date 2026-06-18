@@ -1,0 +1,16 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "whatsapp-agent-cli",
+  "description": "Local marketplace shipping the WhatsApp channel plugin used by whatsapp-agent-cli.",
+  "owner": {
+    "name": "whatsapp-agent-cli"
+  },
+  "plugins": [
+    {
+      "name": "whatsapp",
+      "description": "WhatsApp channel for Claude Code — bridges a WhatsApp number into a running Claude Code session.",
+      "category": "messaging",
+      "source": "./whatsapp"
+    }
+  ]
+}

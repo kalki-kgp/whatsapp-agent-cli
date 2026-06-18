@@ -6,7 +6,7 @@ __pycache__/
 node_modules/
 logs/
 state.json
-whatsapp/
+/whatsapp/
 image_cache/
 audio_cache/
 document_cache/
